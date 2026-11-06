@@ -20,7 +20,7 @@ ITB_PROMPT = """A cost anomaly was detected in a cloud billing dataset. Your job
 Anomaly details (from anomaly.json, also in your working directory):
 {anomaly}
 
-The file data.csv in your working directory contains the daily cost data for the accounts. Investigate it with code (inspect the columns first) and determine which resource(s) caused the anomalous cost for this account on this date. A resource is identified by its name (the value in the data) and its type (the dimension/column it belongs to, written in title case, e.g. "Cloud Service").
+The file data.csv in your working directory contains the daily cost data for the accounts. Investigate it with code (inspect the columns first) and determine which resource(s) caused the anomalous cost for this account on this date. A resource is identified by its name (the exact value as it appears in data.csv) and its type (the data.csv column that value comes from, written in title case with spaces instead of underscores, e.g. a value from a column named some_column has type "Some Column").
 
 Required final answer format (JSON inside <answer></answer> tags):
 {{"resource": [{{"name": "<resource name>", "type": "<resource type>"}}]}}

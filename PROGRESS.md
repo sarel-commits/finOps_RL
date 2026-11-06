@@ -10,7 +10,8 @@
 - venv: ~/finops-eval/.venv (CPython 3.12.16); versions pinned in requirements.lock
   - mlx 0.32.4, mlx-lm 0.32.2, mlx-vlm 0.7.12, transformers 5.22.1, huggingface-hub 2.4.0, datasets 5.1.0
 
-## Phase 1: Download (in progress) + model card notes
+## Phase 1: Download — DONE + model card notes
+- Finished 01:57 (DOWNLOAD_OK); 55 GB on disk. Verification (logs/verify_download.log): 18/18 shards present; all LFS files match Hub SHA-256 + size; crc32.txt: 5/8 match, 3 mismatches traced to a stale upstream crc32.txt (local files byte-identical to Hub blobs, see DECISIONS #14).
 - Started 00:11 via scripts/download.sh (resumable loop, log logs/download.log). Link ~34 Mbps; ~6.8 MB/s effective.
 - Model card / config facts (from config.json, generation_config.json, chat_template.jinja, README.md):
   - Architecture: `Qwen3_5ForConditionalGeneration`, model_type `qwen3_5`, pipeline `image-text-to-text`; 27.78B params BF16; text decoder 64 layers (hybrid: 3x linear_attention : 1x full_attention), hidden 5120, 24 heads / 4 KV heads, vocab 248,320.
@@ -26,3 +27,26 @@
 - Synthetic eval: scripts/gen_synthetic.py → 43 tasks / 7 categories, deterministic (GT sha256[:16] 6f909dfab764aed0 on two runs); oracle test 43/43.
 - Harness: scripts/agent.py (native tool calls + ReAct fallback, checkpointing, retries, server auto-restart), scripts/run_bench.py, scripts/server.sh, scripts/sanity_perf.py, scripts/verify_download.py.
 - Non-LLM heuristic reference on ITBench-Lite: top-instance-family-by-delta 9/15 = 60.0%; auto-dimension variant 7/15 = 46.7% (results/itbench_lite/_heuristic_baseline/).
+
+## Phase 2: Quantize — DONE (01:58)
+- `python -m mlx_lm convert --hf-path models/qwen3.8-27b-bf16 -q --q-bits 8 --q-group-size 64 --q-mode affine --mlx-path models/qwen3.8-27b-mlx-8bit` → 27 GB, 6 shards, 8.501 bits/weight, quantization {group_size 64, bits 8, mode affine}. Log: logs/convert.log.
+- Sanity (results/sanity/sanity_perf_8bit.json): arithmetic FAIL (answered 67542, correct 68315), RI definition PASS, strict JSON PASS. Decode 18–22 tok/s; prefill 841 tok/s @5.5k, 597 @55k, 263 @220k tokens; peak 28.9 GB (short) → 54.8 GB @220k context.
+
+## Phase 3: Server — DONE
+- scripts/server.sh: mlx_lm.server on 127.0.0.1:8080, logs/server.log, prompt cache 10, + caffeinate tied to the server pid.
+- scripts/healthcheck.py: chat OK, thinking OK (reasoning field), native tool calls OK → no ReAct fallback needed.
+- Debugged ~16-min generation stalls → macOS idle system sleep (DECISIONS #15). Fixed with caffeinate; verified (400 tokens in 23 s, twice).
+- Smoke test revealed prompt priming on resource type → prompt fixed (DECISIONS #16).
+
+## Phase 4: Benchmarks — RUNNING (started ~05:00 via scripts/run_all.sh, log logs/run_all.log)
+
+### 4.1 ITBench-Lite non-thinking — DONE (08:1x)
+- 45/45 runs completed (scores: results/itbench_lite/nothink_native/summary.json).
+- root_cause_resource 48.9% ± 3.8% (seeds 46.7/46.7/53.3); 22 pass / 23 fail.
+- 17 failures = 20-step cap with no answer; 6 = wrong entity (wrong column/dimension). 0 harness-parsed tool calls, 0 leak flags.
+- Mean 261 s/run, 114.7k prompt tokens/run (cumulative over steps), 3.5k output tokens/run.
+- analyze.py run; REPORT §2.1 written. Synthetic eval started automatically (~17 s/task).
+
+### 4.4 Synthetic — DONE (09:42)
+- 129/129 runs; 93.0% ± 2.3% (120 pass). Failures: 6 step-cap, 2 wrong_computation, 1 wrong_entity.
+- REPORT §2.2 written; analyze.py re-run. ITBench thinking run (think_native) started 09:42.
