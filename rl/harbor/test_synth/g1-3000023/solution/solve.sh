@@ -1,0 +1,4 @@
+#!/bin/bash
+cat > /app/answer.json <<'EOF'
+{"resource": [{"name": "3UX5yCv5w8", "type": "Instance Family"}, {"name": "3yfYNx1QQi", "type": "Instance Family"}, {"name": "xRk4DKpJ6B", "type": "Instance Family"}]}
+EOF

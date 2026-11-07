@@ -1,0 +1,120 @@
+# prime-rl: LoRA-GRPO on finops-rca, Qwen3.8-27B (qwen3_5 dense hybrid, VLM checkpoint), ONE node 8xH200 (AWS p5en.48xlarge).
+#
+# Written against prime-rl @ c82ef25 (2026-11-05) and verifiers 0.4.1, from examples/basic/wiki-search/rl.toml
+# (same pattern: verifiers taskset + null harness + subprocess runtime + LoRA) and examples/extra/vlm/rl-qwen3.5.toml.
+# NOT yet validated against the schema here (installing prime-rl-configs was not permitted in this session).
+# Validate first on the training node:
+#   uv run rl @ rl/configs/prime-rl/finops-rca-27b-lora.toml --dry-run      # or the CLI's config-check flag
+# Lines marked VERIFY are assumptions about field names/values.
+
+max_steps = 200
+seq_len = 65536                       # 20 tool turns x (code + <=8000-char observation) fits well under this
+
+[deployment]
+num_train_gpus = 4                    # FSDP2 over 4 GPUs; LoRA => base weights frozen, small optimizer state
+num_infer_gpus = 4                    # 4 vLLM replicas (27B bf16 fits one H200); rollouts dominate wall time
+
+[model]
+name = "Qwen/Qwen3.8-27B"             # VERIFY: the exact HF id/revision used for the local eval (8c0b3d30...)
+
+[model.vlm]
+freeze_vision_encoder = true          # text-only task; LoRA requires a frozen encoder anyway
+
+[trainer.model.lora]
+rank = 16
+alpha = 32
+dropout = 0.0
+# Qwen3.5 dense is hybrid: 48/64 layers are GatedDeltaNet linear attention (in_proj_qkv / in_proj_z / out_proj),
+# 16/64 full attention. The default target list would silently skip the linear-attention projections.
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+                  "in_proj_qkv", "in_proj_z", "out_proj"]
+
+[trainer.optim]
+type = "adamw"                        # VERIFY: name of the AdamW optimizer type (examples omit `type` for LoRA)
+lr = 1e-5                             # LoRA RL range 1e-5..5e-5; start low
+weight_decay = 0.0
+max_norm = 1.0
+
+[ckpt]
+interval = 25
+
+[monitors.file]
+path = "metrics.jsonl"
+
+[orchestrator]
+batch_size = 256                      # rollouts per step = 32 tasks x group_size 8
+max_staleness = 2                     # VERIFY default is 8; keep low for a first run
+
+[orchestrator.concurrency]
+initial_inflight = 128
+
+[orchestrator.renderer]
+name = "qwen3.5"                      # VERIFY: renderer matching the Qwen3.8-27B chat template ("auto" also possible)
+enable_thinking = false               # VERIFY field exists for this renderer; baseline + eval are non-thinking
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.train.algo]
+type = "grpo"
+
+[orchestrator.train.select]
+shuffle = true
+seed = 0
+
+[orchestrator.train.sampling]
+temperature = 1.0                     # train at T=1 (no logprob mismatch from truncated sampling)
+top_p = 1.0
+max_completion_tokens = 4096          # per model turn
+
+[[orchestrator.train.source]]
+name = "finops-rca-train"
+# Use the calibrated subset (0 < pass@8 < 1) once rl/scripts/calibrate.py has run on the base policy;
+# the gate below additionally drops groups whose advantages are all zero.
+curriculum = { gates = { zero_advantage = { type = "advantage_range" } } }
+env.taskset.id = "finops-rca"
+env.taskset.split = "train"
+# env.taskset.manifest = "rl/data/train_calibrated.jsonl"
+env.taskset.tools.sandbox_backend = "bwrap"   # install bubblewrap on the node; never "none" for training
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+env.agent.max_turns = 21                      # 20 tool turns + 1 answer turn (also enforced by the task + tool)
+
+[orchestrator.eval]
+interval = 10
+group_size = 3
+
+[orchestrator.eval.sampling]                  # eval with the model-card sampling used by the baseline
+temperature = 0.7
+top_p = 0.8
+max_tokens = 4096
+
+[[orchestrator.eval.source]]
+name = "itbench-lite"                         # 15 held-out real scenarios (never in train)
+env.taskset.id = "finops-rca"
+env.taskset.split = "itbench_lite"
+env.taskset.tools.sandbox_backend = "bwrap"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+env.agent.max_turns = 21
+
+[[orchestrator.eval.source]]
+name = "synthetic-val"
+select.include.idx = ["0:100"]
+env.taskset.id = "finops-rca"
+env.taskset.split = "val"
+env.taskset.tools.sandbox_backend = "bwrap"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+env.agent.max_turns = 21
+
+[inference.vllm]
+dtype = "bfloat16"
+max_model_len = 65536
+tensor_parallel_size = 1
+data_parallel_size = 4
+enable_prefix_caching = true
+enable_auto_tool_choice = true
+tool_call_parser = "qwen3_coder"              # same XML tool-call format the local mlx server parsed
+mamba_cache_dtype = "float32"                 # hybrid linear-attention state, as in the qwen3.5 example
+gpu_memory_utilization = 0.85

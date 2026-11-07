@@ -63,7 +63,7 @@ def answer_ids(bench, ans):
 
 def classify(bench, r, tr):
     err = r.get("error") or ""
-    if err in ("timeout_budget", "max_steps", "max_tokens_no_answer") or (tr.get("n_tool_timeouts") or 0) > 0:
+    if err in ("timeout_budget", "max_steps", "max_tokens_no_answer", "forced_final_no_answer") or (tr.get("n_tool_timeouts") or 0) > 0:
         return "timeout"
     if err.startswith("exception"):
         return "tool_call_failure"
@@ -102,7 +102,9 @@ def main():
     configs = []
     for bench in ["itbench_lite", "synthetic"]:
         for d in sorted((RES / bench).glob("*/summary.json")):
-            if d.parent.name.startswith("_"):
+            if d.parent.name.startswith("_") or "failedruns" in d.parent.name:
+                continue
+            if json.loads(d.read_text()).get("n_runs") not in (45, 129):  # skip partial/stopped runs
                 continue
             configs.append((bench, d.parent.name))
     analysis = {}
@@ -127,22 +129,30 @@ def main():
 
     # ---------- charts ----------
     summ = {f"{b}/{c}": json.loads((RES / b / c / "summary.json").read_text()) for b, c in configs}
-    # 1. ITBench-Lite per-scenario pass rate per config
-    itb = [k for k in summ if k.startswith("itbench_lite/")]
+    # 1. ITBench-Lite per-scenario pass rate: heatmap (configs x scenarios), full 45-run configs only
+    itb = [k for k in summ if k.startswith("itbench_lite/") and summ[k].get("n_runs") == 45]
     if itb:
         items = list(summ[itb[0]]["per_item_pass_rate"].keys())
-        fig, ax = plt.subplots(figsize=(11, 4.2))
-        w = 0.8 / len(itb)
-        for j, k in enumerate(itb):
-            vals = [summ[k]["per_item_pass_rate"].get(i, 0) * 100 for i in items]
-            ax.bar([x + j * w - 0.4 + w / 2 for x in range(len(items))], vals, w * 0.92, color=SERIES[j % 4],
-                   label=k.split("/")[1])
+        steps = ["#cde2fb", "#86b6ef", "#2a78d6", "#104281"]  # 0/3, 1/3, 2/3, 3/3 (sequential blue)
+        fig, ax = plt.subplots(figsize=(11, 0.55 * len(itb) + 1.6))
+        ax.grid(False)
+        for y, k in enumerate(itb):
+            for x, i in enumerate(items):
+                n = round(summ[k]["per_item_pass_rate"].get(i, 0) * 3)
+                ax.add_patch(plt.Rectangle((x - 0.47, y - 0.45), 0.94, 0.9, color=steps[n], linewidth=0))
+                ax.text(x, y, f"{n}/3", ha="center", va="center", fontsize=8,
+                        color="#ffffff" if n >= 2 else C["text"])
+        ax.set_xlim(-0.5, len(items) - 0.5)
+        ax.set_ylim(len(itb) - 0.5, -0.5)
         ax.set_xticks(range(len(items)))
         ax.set_xticklabels([i.replace("Scenario-", "S") for i in items])
-        ax.set_ylabel("pass rate across seeds (%)")
-        ax.set_ylim(0, 105)
-        ax.set_title("ITBench-Lite FinOps: root_cause_resource pass rate per scenario", loc="left", fontsize=11)
-        ax.legend(frameon=False, loc="upper right", ncols=len(itb))
+        ax.set_yticks(range(len(itb)))
+        ax.set_yticklabels([f"{k.split('/')[1]}  ({summ[k]['mean_acc'] * 100:.1f}%)" if isinstance(summ[k].get('mean_acc'), (int, float))
+                            else k.split('/')[1] for k in itb])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        ax.tick_params(length=0)
+        ax.set_title("ITBench-Lite FinOps: seeds passing (root_cause_resource) per scenario", loc="left", fontsize=11)
         fig.tight_layout()
         fig.savefig(ASSETS / "itbench_lite_per_scenario.png", dpi=150)
         plt.close(fig)
@@ -200,7 +210,7 @@ def main():
         data.append([r["wall_s"] / 60 for r in rows if r.get("wall_s")])
         labels.append(f"{b}/{c}")
     if data:
-        bp = ax.boxplot(data, vert=False, patch_artist=True, widths=0.5,
+        bp = ax.boxplot(data, orientation="horizontal", patch_artist=True, widths=0.5,
                         medianprops=dict(color=C["text"], linewidth=2), flierprops=dict(markersize=4, markerfacecolor=C["muted"], markeredgecolor=C["muted"]))
         for p in bp["boxes"]:
             p.set_facecolor(C["s1"] + "55")

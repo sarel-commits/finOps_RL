@@ -95,7 +95,8 @@ def main(bench, config):
                     gen_s=tr.get("gen_s"), n_steps=tr.get("n_steps"), n_tool_calls=tr.get("n_tool_calls"),
                     n_tool_errors=tr.get("n_tool_errors"), protocol=tr["config"]["protocol"],
                     raw_tool_parsed=tr.get("n_raw_tool_calls_parsed_by_harness", 0),
-                    leak=tr.get("leak_check_ground_truth"), answer=tr.get("answer"))
+                    leak=tr.get("leak_check_ground_truth"), answer=tr.get("answer"),
+                    forced_final=bool(tr.get("forced_final", False)))
         if bench == "itbench_lite":
             s = score_itb_one(tr.get("answer"), gt[item])
             base.update(s, gt=gt[item], passed=s["root_cause_resource"])
@@ -135,7 +136,8 @@ def main(bench, config):
         cats = sorted({r["category"] for r in rows})
         summ["per_category"] = {}
         for c in cats:
-            vals = [st.mean([r["passed"] for r in rows if r["seed"] == s and r["category"] == c]) for s in seeds]
+            grp = [[r["passed"] for r in rows if r["seed"] == s and r["category"] == c] for s in seeds]
+            vals = [st.mean(g) for g in grp if g]  # skip seeds with no runs in this category (partial re-runs)
             summ["per_category"][c] = dict(mean=st.mean(vals), std=st.stdev(vals) if len(vals) > 1 else 0.0,
                                            n_items=len({r["item"] for r in rows if r["category"] == c}),
                                            passes=sum(r["passed"] for r in rows if r["category"] == c),

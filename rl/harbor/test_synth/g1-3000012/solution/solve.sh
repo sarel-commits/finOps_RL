@@ -1,0 +1,4 @@
+#!/bin/bash
+cat > /app/answer.json <<'EOF'
+{"resource": [{"name": "1cd", "type": "Application"}, {"name": "1sz", "type": "Application"}, {"name": "5MJ", "type": "Application"}, {"name": "7wA", "type": "Application"}, {"name": "J3K", "type": "Application"}, {"name": "Q3Y", "type": "Application"}, {"name": "QvT", "type": "Application"}, {"name": "UAN", "type": "Application"}, {"name": "bhx", "type": "Application"}, {"name": "i5O", "type": "Application"}, {"name": "mb4", "type": "Application"}, {"name": "v9P", "type": "Application"}]}
+EOF

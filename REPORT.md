@@ -11,11 +11,16 @@
 | 1. Download BF16 | ✅ done | 55.6 GB in 1h46m; 18/18 shards SHA-256 verified |
 | 2. Quantize to 8-bit | ✅ done | affine 8-bit g64 → 27 GB, 8.501 bpw; sanity 2/3 (arithmetic failed) |
 | 3. Local server | ✅ done | mlx_lm.server 127.0.0.1:8080; native tool calls OK; sleep-stall bug fixed with caffeinate |
-| 4.1 ITBench-Lite FinOps | 🟡 non-thinking done; thinking running (started 09:42) | non-thinking: **48.9% ± 3.8%** (22/45 runs) |
+| 4.1 ITBench-Lite FinOps | 🟡 baseline done; follow-up running | non-thinking baseline: **48.9% ± 3.8%** (22/45 runs). Thinking run stopped at 5/45 (DECISIONS #18) |
+| 4.1b Follow-up: budget nudges + prompt v2 | ⏸ stopped by user | A stopped at 10/45 runs; B and C not started (DECISIONS #21) |
+| 4.1c Failed runs on Together Qwen3.8-Flash | ✅ done | ITBench-Lite 1/23 rescued, synthetic 7/9 rescued; cost ≈ $0.74 (DECISIONS #23) |
+| — Qwen3.8-2.4T-A95B-FP8 | ⛔ unavailable | not servable on Together (DECISIONS #22) |
+| 4.1d Failed runs on GLM-5.3 / Kimi-K3.1-Pro | ✅ done (resumed) | ITBench-Lite rescued: Kimi 21/23, GLM 12/23; synthetic 9/9 both. Mistral 4 and Opus 5.5 not available (DECISIONS #24–25) |
+| 4.1e Harness improvements (nudges, prompt v2, repeat guard, thinking effort) | ✅ done | **Flash: 20.0% → 82.2%** (nudges + v2) **→ 95.6%** (+ thinking-medium). **27B: 48.9% → 84.4%** (nudges + v2; decision rule passed) **→ 100%** (+ thinking-medium; strict set match 60%). Post-tuning. Synthetic nudges + v2: 93.0% → 99.2%. Guard alone: no change (84.4%). All runs complete (DECISIONS #26–30) |
 | 4.2 Full ITBench FinOps | ⛔ skipped | needs Kubernetes + container runtime (see Skipped) |
 | 4.3 aws-bench | ⛔ skipped (by design) | provisions real AWS; review only |
-| 4.4 Synthetic FinOps eval | ✅ done | 43 tasks × 3 seeds: **93.0% ± 2.3%** (120/129) |
-| 5. Analysis | ⏳ pending | |
+| 4.4 Synthetic FinOps eval | ✅ done | 43 tasks × 3 seeds: **93.0% ± 2.3%** (120/129); post-tuning nudges + v2: **99.2%** (128/129) |
+| 5. Analysis | ✅ done (updates as runs finish) | Error analysis §4, recommendations §9 |
 
 ## 1. Setup
 
@@ -52,12 +57,12 @@ Raw output: `results/itbench_lite/nothink_native/` (`<Scenario>/seed_<s>/traject
 
 | Config | root_cause_resource (official) | n | Pass / fail | Strict set match | Name-only match | F1 (name,type) | Answered (parsed) |
 |---|---|---|---|---|---|---|---|
-| **8-bit, non-thinking** | **48.9% ± 3.8%** (per seed 46.7 / 46.7 / 53.3) | 45 runs (15 × 3) | 22 / 23 | 35.6% ± 7.7% | 48.9% ± 3.8% | 0.444 ± 0.000 | 28 / 45 |
-| 8-bit, thinking | *queued* | | | | | | |
+| **8-bit, non-thinking** | **48.9% ± 3.8%** (per seed 46.7 / 46.7 / 53.3) | 45 runs (15 × 3) | 22 / 23 | 35.6% ± 7.7% | 48.9% ± 3.8% | 0.444 ± 0.000† | 28 / 45 |
+| 8-bit, thinking (xhigh, original harness) | *stopped on user instruction, not scored* (DECISIONS #18); thinking with the improved harness is in section 2.5: **100%** | | | | | | |
 | *Non-LLM heuristic (reference)* | *60.0%* (top instance family by cost delta) | 15 | 9 / 6 | | | | |
 | *Non-LLM heuristic, auto-dimension* | *46.7%* | 15 | 7 / 8 | 46.7% | | 0.526 | |
 
-± is the std across the 3 seed-level accuracies. The heuristic baselines are `results/itbench_lite/_heuristic_baseline/` (`scripts/itbench_heuristic_baseline.py`). They are a sanity reference for task difficulty, **not** an agent result.
+± is the std across the 3 seed-level accuracies. † F1 is averaged per seed, then the std is taken across seeds. The zero std is a coincidence, not a bug: every seed's F1 sums to 6.667/15 (DECISIONS #20). The heuristic baselines are `results/itbench_lite/_heuristic_baseline/` (`scripts/itbench_heuristic_baseline.py`). They are a sanity reference for task difficulty, **not** an agent result.
 
 **What the numbers mean**
 - **The step budget is the main failure.** 17 of 45 runs (38%) used all 20 steps and never gave an answer. Of the 28 runs that did answer, **22 were correct (78.6%)**. The model can usually find the root cause but often fails to commit to it. It keeps re-running near-identical pandas analyses (e.g. `Scenario-4/seed_2`: steps 7–18 are variations of one group-by/delta script, and step 19 says "The root cause is clear. Let me verify…" before the budget runs out).
@@ -92,7 +97,113 @@ The synthetic anomaly tasks give the date, account and service of a single injec
 
 ![Synthetic per category](report_assets/synthetic_per_category.png)
 
-### 2.3 Full ITBench FinOps and aws-bench
+**Post-tuning: nudges + prompt v2** (`results/synthetic/nothink_nudges_v2/`; same 43 tasks × 3 seeds, non-thinking). On synthetic tasks v2 changes only the system prompt (budget discipline, "an empty result is a valid answer"); the ITBench method block is not used. That sentence was written after the idle_05 failure, so this is post-tuning too.
+
+**Overall: 99.2% ± 1.3%** (per seed 100 / 100 / 97.7; 128/129; Wilson 95.7–99.9%), up from 93.0%. All 129 runs answered, with no step-cap failures. 15 runs reached the forced final and **all 15 were correct**. Mean steps went from 5.5 to 8.1 and mean wall time from 42 s to 69 s.
+
+| Category | Baseline (v1) | Nudges + v2 |
+|---|---|---|
+| idle_resources | 77.8% | **100%** (idle_05, the empty-list case, now passes in all seeds) |
+| top_drivers | 80.0% | **100%** |
+| commitment_math | 88.9% | 94.4% |
+| spend_total, mom_change, rightsizing, anomaly_detection | 100% | 100% |
+
+The only failure left is **commit_06 seed 3**. It gives the same wrong answer as the baseline (20 RIs / $905.20, mixing monthly and yearly cost), so it is a reasoning error the harness cannot fix. As on ITBench, every gain came from step-cap failures turning into answers.
+
+### 2.3 Failed runs re-run on Together `Qwen/Qwen3.8-Flash` (user-approved paid API run)
+
+The user asked for the failed benchmarks on `Qwen/Qwen3.8-2.4T-A95B-FP8`. Together does not serve that model: it has no serverless access and no dedicated-endpoint hardware (DECISIONS #22). The user then chose `Qwen/Qwen3.8-Flash`. Only the (item, seed) runs that the local 8-bit baseline **failed** were re-run, with identical agent, prompt (v1), sampling, non-thinking mode, 20-step cap and seeds (DECISIONS #23). Raw output: `results/{itbench_lite,synthetic}/flash_failedruns/`. The pair lists are `results/*/failed_pairs_nothink_native.txt`.
+
+**These are rescue rates on the hardest subset, not benchmark scores, and they are not comparable to 48.9% or 93.0%.**
+
+| Subset | Runs | Rescued (pass) | Answered | Hit 20-step cap | Mean steps | Mean wall/run | Tokens in / out | Est. cost† |
+|---|---|---|---|---|---|---|---|---|
+| ITBench-Lite baseline failures | 23 | **1 / 23** (S1 seed 2) | 2 | 21 | 19.3 | 75 s | 4,397,260 / 89,526 | $0.70 |
+| Synthetic baseline failures | 9 | **7 / 9** | 7 | 2 (idle_05, both seeds) | 7.8 | 16 s | 208,182 / 6,767 | $0.03 |
+
+† Token counts from the API `usage` field × Together list price ($0.15/M input, $0.47/M output). This is an estimate, not an invoice.
+
+**Findings**
+- **The step-cap failure is not specific to the local 8-bit model.** Flash hit the 20-step cap on 21 of 23 ITBench-Lite failures. It shows the same behaviour: it keeps re-verifying after finding the signal. In `Scenario-3/seed_1` it inspects d7I, the true root-cause Application, early and still never answers. Its only other answer, S6 seed 3, listed **125 Instance Families** (wrong dimension; ground truth is 20 Applications). Together with the smoke run in §2.1, this points to the harness and prompt (no budget awareness, no forcing of a final answer) as the main cause of the ITBench-Lite gap, more than 8-bit quantization or model size. The interrupted follow-up (budget nudges + prompt v2) was designed to test exactly this.
+- **Synthetic: Flash fixed 7 of 9.** It answered both commitment-math errors (commit_04, commit_06), both idle_03 timeouts, the top_drivers timeouts and the row-index entity error (top_drivers_04). It failed idle_05 in both seeds, again by searching for 20 steps when the correct answer is an empty list.
+- Flash is about 3.5× faster per ITBench-Lite run than the local 8-bit model (75 s vs 261 s), at about 3 cents per run.
+
+**Other models on the same failed runs** (DECISIONS #24–25; provider-default sampling, thinking off; otherwise identical harness). Mistral 4 is not served on Together and there is no Mistral key. Opus 5.5 was not run because there is no Anthropic API key. Raw output: `results/*/glm53_failedruns/`, `results/*/kimik31_failedruns/`. Comparison: `results/analysis/failedruns_compare.json`.
+
+| Model (Together) | ITBench-Lite rescued (n=23) | Answered | Step cap | Wrong dimension | Synthetic rescued (n=9) | Mean steps (ITB) | Mean wall (ITB) | Est. cost† |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash | 1 | 2 | 21 | 1 | 7 | 19.3 | 75 s | $0.74 |
+| GLM-5.3 | 12 | 12 | 2 | 0 | **9** | 11.6 | 114 s | $5.95 |
+| **Kimi-K3.1-Pro** | **21** | 22 | 1 | 0 | **9** | 9.7 | 88 s | $4.79 |
+
+- **Kimi-K3.1-Pro rescues almost every ITBench-Lite failure** (21/23; it missed only S8 seed 1 and S11 seed 1), in about 10 steps, with no wrong-dimension answers. It also solves both Application-dimension scenarios (S3 and S6) in every seed where the local model failed them. A stronger model therefore *does* finish within the same 20-step harness. The step cap stops weaker models; it is not an impossible budget.
+- GLM-5.3 rescues about half (12/23). It still misses all three S6 seeds (20 Application root causes) and several S8 and S11 seeds.
+- Both GLM and Kimi fixed all 9 synthetic failures, including idle_05 (correct answer: empty list).
+
+![Rescue rate on failed runs](report_assets/failedruns_rescue.png)
+
+### 2.5 Harness improvements: budget nudges, prompt v2, repeat guard, thinking effort (**post-tuning**)
+
+Every configuration runs on the **full** ITBench-Lite set (15 × 3 seeds) and is comparable to the 48.9% baseline and the 60% heuristic. **Post-tuning**: prompt v2 and the guard were designed from failures on these same 15 scenarios, so gains here are an optimistic upper bound until confirmed on unseen scenarios. Harness options (DECISIONS #19, #26, #27):
+- **nudges:** a step counter in every observation, a warning when 5 calls remain, and a forced no-tools final turn after 20 tool calls.
+- **v2:** a system prompt with budget discipline ("an empty result is a valid answer") and an ITBench method block ("compute the per-value cost change for EVERY categorical column, then choose the dimension"). It names no column and encodes no ground truth.
+- **guard:** a note when the code is ≥ 90% similar to an earlier call.
+- **think-medium:** thinking on, `reasoning_effort=medium`.
+
+Metrics: `results/analysis/followup.json` (`scripts/followup_analysis.py`). The CI is a 95% Wilson interval over the 45 runs, which treats runs as independent. Runs are clustered by scenario, so the true uncertainty is wider.
+
+| Model | Config | Official (mean ± std) | Per seed | 95% CI | Answered | Acc. when answered | Forced finals (pass) | Wrong dim. | Mean steps | Mean wall | Est. cost |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| — | Heuristic (top instance family) | 60.0% | — | 35.7–80.2% (n=15) | | | | | | | |
+| 27B 8-bit local | baseline (v1) | 48.9% ± 3.8% | 46.7 / 46.7 / 53.3 | 35.0–63.0% | 28/45 | 78.6% | — | 6 | 14.2 | 261 s | $0 |
+| 27B 8-bit local | **nudges + v2** (pre-registered test) | **84.4% ± 7.7%** | 80.0 / 93.3 / 80.0 | **71.2–92.3%** | 44/45 | 86.4% | 7 (3) | 6 | 13.6 | 365 s | $0 |
+| 27B 8-bit local | **think-medium + nudges + v2 + guard** | **100% ± 0.0%** (45/45) | 100 / 100 / 100 | **92.1–100%** | 45/45 | 100% | 0 | 0 | 8.5 | 480 s | $0 |
+| 27B 8-bit local | nudges + v2 + guard | 84.4% ± 7.7% | 80.0 / 93.3 / 80.0 | 71.2–92.3% | 45/45 | 84.4% | 6 (3) | 6 | 13.5 | 274 s | $0 |
+| Qwen3.8-Flash | baseline (v1) | 20.0% ± 6.7% | 13.3 / 26.7 / 20.0 | 10.9–33.8% | 12/45 | 75.0% | — | 2 | 17.6 | 60 s | $1.23 |
+| Qwen3.8-Flash | **nudges + v2** | **82.2% ± 10.2%** | 73.3 / 93.3 / 80.0 | **68.7–90.7%** | 45/45 | 82.2% | 24 (18) | 6 | 16.4 | 63 s | $1.34 |
+| Qwen3.8-Flash | nudges + v2 + guard | 82.2% ± 3.8% | 80.0 / 86.7 / 80.0 | 68.7–90.7% | 45/45 | 82.2% | 31 (27) | 4 | 18.9 | 75 s | $1.76 |
+| Qwen3.8-Flash | **think-medium + nudges + v2 + guard** | **95.6% ± 3.8%** | 93.3 / 93.3 / 100 | **85.2–98.8%** | 45/45 | 95.6% | 0 | 0 | 8.5 | 68 s | **$0.66** |
+
+**Flash findings so far**
+- **The harness, not the model, was the main bottleneck for Flash.** It went from 20.0% to 82.2% (+62 pp) with nudges + v2. Step-cap timeouts dropped from 33/45 to 0, and accuracy when answered held at 75–82%.
+- **Forced finals carry a lot of the gain.** 24 of 45 runs still used all 20 steps, and 18 of those 24 forced answers were correct (75%). The model often has the answer but will not stop on its own.
+- **Per scenario**, Flash nudges + v2 is 3/3 on 9 scenarios, including S4 and S15, which both baselines (local 27B and Flash) failed in all 3 seeds. S3 (2/3) and S6 (2/3) now mostly pick the Application dimension. 6 wrong-dimension answers remain, spread over S3, S6, S8, S11, S12 and S14.
+- **Repeat guard: no effect without thinking.** 82.2% both with and without it. With the guard, more runs went to the forced final (31 vs 24), and those were more often right (87% vs 75%). It fired 80 times across 45 runs.
+- **Thinking (medium effort) is the biggest single lever.** Flash reached **95.6%** (strict set match 93.3%, F1 0.978). It used **no** forced finals and **zero** wrong-dimension answers, and it took 8.5 steps on average instead of 16–19. Because the runs are shorter, it was also the cheapest Flash config ($0.66 for 45 runs). The only misses were S9 seeds 1–2, where it found 1 of the 2 root-cause families. With thinking on, the model plans the all-columns comparison and commits, rather than iterating in code.
+- **Against the decision rule** (stated in DECISIONS #26 before any results): Flash nudges + v2 at 82.2% is above the ~70% bar and above the heuristic's 60%. But the Wilson lower bound of 68.7% sits right at the bar, n = 15 scenarios, and the prompt is post-tuning. Read it as *strong but not conclusive* evidence that model + light harness beats the rule. **Flash with thinking at 95.6% (CI lower bound 85.2%) clears both the ~70% bar and the heuristic decisively**, still post-tuning and on 15 scenarios. The pre-registered test for the local model is the 27B `nudges + v2` run: **84.4%, passed** (see below). 27B thinking then scored **100% (45/45)** on the official metric (60% strict set match); see below.
+
+**Local 27B findings (pre-registered decision run)**
+- **27B 8-bit with nudges + v2 scores 84.4% ± 7.7%** (38/45; per seed 80.0 / 93.3 / 80.0; Wilson 71.2–92.3%), up from **48.9%** (+35.5 pp). Strict set match 35.6%, F1 0.664.
+- **Every scenario now passes in at least 2 of 3 seeds** (9 at 3/3, 6 at 2/3). That includes S3, S4, S6, S11 and S15, which the baseline failed in all 3 seeds. The heuristic gets 9/15.
+- **Mechanism**: step-cap failures dropped from 17/45 to 1/45. Only 7 runs needed a forced final, and 3 of those 7 were correct. That is far fewer than Flash (24), so the 27B model stops on its own much more often. Accuracy when answered rose from 78.6% to 86.4%, so the method block also improves the answers themselves, not only the answer rate.
+- **Remaining errors**: 6 wrong-dimension answers (S3, S6, S11, S13, S14, S15; one seed each) plus 1 no-answer at the step cap.
+- **Decision rule (DECISIONS #26, stated before the run): B = 84.4% ≥ ~70%, so the model + light harness beats the heuristic.** The Wilson lower bound (71.2%) is also above the bar. Caveats still apply: the result is post-tuning, n = 15 scenarios, and the CI ignores clustering by scenario. Confirm it on unseen scenarios before relying on it.
+- Cost: 4.6 h of local compute for 45 runs (365 s/run mean, vs 261 s at baseline, because more runs finish their investigation instead of stalling early).
+
+**Local 27B, repeat guard without thinking**
+- **84.4% ± 7.7%, identical to nudges + v2 without the guard.** The per-seed values are also identical (80.0 / 93.3 / 80.0), but the failing runs differ: S2, S7 and S4 fail here instead of S11, S14 and S9. So this is a coincidence in the totals, not a duplicated result. Strict set match 40.0% (vs 35.6%), F1 0.681 (vs 0.664). The guard fired 61 times.
+- **This matches Flash: the guard alone does not change the score.** Its only measurable effect is on errors. There were 0 step-cap/connection failures and every run answered, and the mean wall time was lower (274 s vs 365 s), because fewer runs drag on re-running near-identical code. The guard is cheap, so keep it, but it is not a lever.
+
+**Local 27B with thinking (medium effort)**
+- **45/45 on the official metric**: every scenario passes in every seed (Wilson 92.1–100%). There were no forced finals, no step-cap failures and no wrong-dimension answers. Mean steps fell to 8.5, from 13.6 without thinking. The repeat guard fired only 3 times in 45 runs.
+- **The official rubric is recall-only.** It passes an answer that contains every ground-truth resource, even with extra resources added. 18 of the 45 passing answers have 1–2 extras, for example S12 seed 3: `oAYMdj0PDJ` (correct) + `vQexwxMSgl` (extra). These are spread over S8, S9, S10, S12 and S15. On the stricter secondary metrics the picture is less perfect:
+
+  | Config | Official | Strict set match | Mean precision | F1 |
+  |---|---|---|---|---|
+  | 27B baseline (v1) | 48.9% | — | 0.42 | 0.444 |
+  | 27B nudges + v2 | 84.4% | 35.6% | 0.58 | 0.664 |
+  | 27B think-medium + nudges + v2 + guard | **100%** | **60.0%** | 0.80 | **0.868** |
+  | Flash think-medium + nudges + v2 + guard | 95.6% | **93.3%** | 0.99 | **0.978** |
+
+  So the 27B with thinking is the best on the official metric, but **Flash with thinking is more precise**: it almost never adds extra resources. Extras are capped at 2 per answer, so the 27B is not gaming the rubric by listing everything; it includes borderline secondary contributors.
+- **Cost**: 480 s/run mean, 6.0 h of local compute for 45 runs, and about 7.4k output tokens per run. That is 1.3× the wall time of nudges + v2 alone, because shorter trajectories offset most of the thinking tokens. Flash with thinking takes 68 s/run.
+- **Same post-tuning caveat as above**: 15 scenarios, and the prompt was tuned on them. 100% here means "solves every scenario we have", not "solves the task".
+
+Per-scenario view of every full 45-run config (seeds passing out of 3):
+
+![ITBench-Lite per scenario](report_assets/itbench_lite_per_scenario.png)
+
+### 2.4 Full ITBench FinOps and aws-bench
 
 Not run (see section 7 and section 8).
 
@@ -110,11 +221,53 @@ Not run (see section 7 and section 8).
 4. **Different model and precision.** Qwen3.8-27B at 8-bit, versus the frontier and open models in the paper.
 5. **Small n.** 15 scenarios × 3 seeds. One scenario is about 6.7 percentage points.
 
-**Internal reference.** A non-LLM heuristic (largest instance-family cost delta) reaches 60% on the same 15 scenarios. The 8-bit model, non-thinking, does not beat it, mostly because 38% of runs hit the step cap.
+**Internal reference.** A non-LLM heuristic (largest instance-family cost delta) reaches 60% on the same 15 scenarios. With the original harness, the 8-bit model (48.9%) does not beat it, mostly because 38% of runs hit the step cap. With budget nudges and prompt v2 it reaches **84.4%** and does beat it (section 2.5; post-tuning). The ITBench paper numbers above come from the original harness and are not comparable to the post-tuning numbers.
 
 ## 4. Error analysis
 
-*Pending.*
+Each failed run gets exactly one category, using the first matching rule in `scripts/analyze.py`. The data is in `results/analysis/error_analysis.json`, and each example's trajectory path is listed there.
+
+| Config | Failed runs | Timeout / step cap | Wrong entity | Wrong computation | Hallucinated data | Tool-call failure | Format/parse |
+|---|---|---|---|---|---|---|---|
+| ITBench-Lite, 27B baseline (v1) | 23 / 45 | **17** | 6 | — | 0 | 0 | 0 |
+| ITBench-Lite, 27B nudges + v2 | 7 / 45 | 0 (1 counted as tool-call failure, see below) | 5 | — | 1 | 1 | 0 |
+| ITBench-Lite, Flash baseline (v1) | 36 / 45 | **33** | 3 | — | 0 | 0 | 0 |
+| ITBench-Lite, Flash nudges + v2 | 8 / 45 | 0 | 8 | — | 0 | 0 | 0 |
+| ITBench-Lite, Flash think-medium + nudges + v2 + guard | 2 / 45 | 0 | 2 | — | 0 | 0 | 0 |
+| Synthetic, 27B baseline (v1) | 9 / 129 | 6 | 1 | 2 | 0 | 0 | 0 |
+
+On ITBench every answer is a (name, type) set, so wrong answers count as "wrong entity" rather than "wrong computation". The **format/parse** category is empty in every config: the model never produced unparseable JSON or the wrong schema.
+
+![Failure categories](report_assets/error_categories.png)
+
+The chart covers only full runs (45 ITBench or 129 synthetic runs). The stopped 10-run `nothink_nudges` partial is excluded, and so is the 27B thinking config, which has no failures.
+
+**Timeout / step cap.** This was the dominant failure before the harness fix: 17 of 23 failures (27B) and 33 of 36 (Flash). The model keeps writing exploratory code and never commits to an answer within 20 tool calls.
+- ITBench S11 seed 1, S12 seed 1, S14 seed 3 (27B baseline): `max_steps`, no answer. In the nudges + v2 run the same pairs answer correctly.
+- Synthetic `idle_03` seed 1 and `top_drivers_01` seed 1: `max_steps` on tasks the model solves in other seeds.
+- Synthetic `idle_05` seed 2: the correct answer is an empty list, and the model kept searching instead of answering `[]`. This is why prompt v2 says "an empty result is a valid answer".
+
+**Wrong entity, mostly the wrong dimension.** Once the model answers, the main error is picking the wrong column: Instance Family instead of Application, or the reverse.
+- S1 seed 2 (27B baseline): answered Application `9fC` ("instance count jump from 9 to 29"), but the ground truth is Instance Family `G1QV542nCO`. Here the model found the right signal but in the wrong column.
+- S3 seed 2 and S6 seed 1 (27B baseline): listed many instance families when the root cause is one or more Applications. Prompt v2's "compare every column" step fixes most of these: S3 and S6 now pass 2/3.
+- S13 seed 3 (27B nudges + v2): reached the forced final and answered Application `WIy` instead of Instance Family `FYuFqJNhxU`. S14 seed 1 mixed dimensions: Cloud Service `h92it` + Application `ap3`.
+- S9 seeds 1–2 (Flash with thinking): found only 1 of the 2 root-cause families (`QD9Fr0KXz9`, missing `Jg50IWfSz0`). This is incomplete-set recall, the only failure type left once thinking is on.
+
+**Wrong computation** (synthetic only):
+- `commit_04` seed 2: total 80.88 vs gold 81.22. The model applied the commitment discount hour by hour but handled the overage threshold incorrectly.
+- `commit_06` seed 3: answered 20 RIs / $905.20 vs gold 12 / $8,342.44. It optimized over a monthly cost when the task asks for a yearly one, which also changes the optimum.
+
+**Wrong entity on synthetic.** `top_drivers_04` seed 2 answered resource id `"5"`, a DataFrame row index, instead of `db-aedad554c6`. The increase value (538.57) was correct.
+
+**Hallucinated data** (1 run). In S6 seed 3 (27B nudges + v2), the model listed 125 instance families, and one of them (`8zdCschgAR`) does not occur in `data.csv`. It is a fabricated ID inside a long, wrong-dimension list. The model enumerated values from memory instead of copying them from tool output. That is the only hallucinated identifier across all runs.
+
+**Tool-call failure** (1 run). In S4 seed 3 (27B nudges + v2), all 20 steps ran, then the forced-final request failed with `APIConnectionError` after retries. The conversation had about 410k cumulative input tokens, so a long prefill most likely exceeded the client timeout. The server process stayed up. This is an infrastructure failure, not a model failure. It still counts as a failure in the 84.4% score.
+
+**Takeaways**
+1. The biggest failure mode was *not stopping*, not reasoning. Budget awareness (nudges and a forced final) removes it.
+2. The next one is *dimension choice*. An explicit "compare every column" method reduces it, and thinking almost removes it.
+3. What remains is set completeness (multi-resource root causes) and a long tail of single mistakes.
+
 
 ## 5. Performance
 
@@ -135,7 +288,7 @@ All figures are measured on this M5 Max (64 GiB), 8-bit model, single request at
 |---|---|---|---|---|---|
 | ITBench-Lite | 45 | 261 / 234 / 417 / 508 s | 14.2 | 13.4 tok/s | 3.26 h |
 | Synthetic | 129 | 42 / 31 / 89 / 147 s | 5.5 | 13.8 tok/s | 1.50 h |
-| ITBench-Lite, thinking | *running* | | | | |
+| ITBench-Lite, thinking (medium) + nudges + v2 + guard | 45 | 480 / 403 / 706 / 1693 s | 8.5 | 15.3 tok/s (wall-based) | 6.0 h |
 
 \* Output tokens divided by time spent inside server calls (98–99% of wall time; tool execution is negligible). It is lower than raw decode because it includes prefill of each new step's observation. The server's prompt cache (10 sequences, ~4.5 GB) avoids re-prefilling the conversation prefix.
 
@@ -145,7 +298,13 @@ All figures are measured on this M5 Max (64 GiB), 8-bit model, single request at
 
 ## 6. Quantization caveat
 
-MLX affine 8-bit (per-group scale + bias, group size 64, integer codes) is **not** FP8 (E4M3/E5M2 floating-point). Apple Silicon has no FP8 hardware path, so this is the closest practical equivalent. BF16-vs-8-bit degradation: *pending*.
+MLX affine 8-bit (per-group scale + bias, group size 64, integer codes) is **not** FP8 (E4M3/E5M2 floating-point). Apple Silicon has no FP8 hardware path, so this is the closest practical equivalent. **BF16-vs-8-bit degradation was not measured** (DECISIONS #17). The ~55 GB BF16 weights would need almost the whole 64 GB of memory, which would swap heavily alongside the user's apps, and the 8-bit server would have to stop. The BF16 weights are kept on disk (`models/qwen3.8-27b-bf16`), so the comparison can be run later on a machine with more memory.
+
+What this means for reading the results:
+- Every 27B number in this report is for **8-bit MLX affine**, not the released FP8 or BF16 checkpoints.
+- 8-bit group-wise affine quantization usually costs little on benchmarks like these (typically within noise), but that is general experience, **not measured here**.
+- The gaps measured here (48.9% → 84.4% from the harness; 20% → 95.6% for Flash) are far larger than any plausible 8-bit effect, so the conclusions about harness design do not depend on quantization.
+- Absolute scores could shift by a few points at BF16. With 15 scenarios, one scenario is 6.7 pp, so such a shift would not be detectable here anyway.
 
 ## 7. Skipped items
 
@@ -153,6 +312,12 @@ See `DECISIONS.md` for full reasoning.
 
 - **Full ITBench FinOps scenarios (37/38)**: need a Kubernetes cluster (kind/minikube → Docker/Podman), helm, kubectl. None installed, no Homebrew, and installing a container VM means system-level changes, which the hard rules forbid.
 - **aws-bench execution**: provisions real AWS resources and costs money. Review only (section 8).
+- **BF16 8-bit-vs-BF16 comparison**: not run because of memory (section 6, DECISIONS #17). The BF16 weights are kept on disk.
+- **27B thinking at the template default (xhigh)**: stopped on user instruction (DECISIONS #18). Its partial runs are not scored. A medium-effort thinking run is in progress instead (section 2.5).
+- **Qwen3.8-2.4T-A95B-FP8**: not served by Together, either serverless or as a dedicated endpoint, and creating cloud endpoints is not allowed (DECISIONS #22).
+- **Mistral 4**: not in the Together catalog, and there is no Mistral key (DECISIONS #24).
+- **Opus 5.5**: there is no Anthropic API key, and Claude Code session credentials were deliberately not used (DECISIONS #24).
+- **GLM-5.3 / Kimi-K3.1-Pro**: only run on the 32 failed baseline pairs, not the full benchmark, and the first attempt was stopped on user instruction (DECISIONS #25).
 
 ## 8. aws-bench review (not executed)
 
@@ -177,4 +342,37 @@ Reviewed `aws-bench/aws-bench` @ `ec7ec56` and `aws-bench/aws-bench-datasets` (c
 
 ## 9. Recommendations
 
-*Pending.*
+**1. Fix the harness before judging the model.** This is the most important finding. With the original harness, both the local 27B (48.9%) and Flash (20.0%) score at or below a one-line heuristic (60%). Adding budget nudges and a forced final answer, plus a method prompt that never names the answer column, raises them to **84.4%** and **82.2%**. Adding medium-effort thinking raises Flash to **95.6%** and the local 27B to **100%** on the official metric (60% strict). For agentic FinOps work, the agent loop decides whether the model succeeds:
+- Show the remaining tool-call budget in every observation, and always allow one final no-tools turn.
+- Say explicitly that an empty or negative result is a valid answer.
+- Ask the model to compare every candidate dimension before choosing one.
+- Use thinking at medium effort where latency allows. On Flash it made runs shorter and cheaper as well as more accurate.
+
+**2. Weakest tasks** (after the fix):
+- *Choosing the root-cause dimension* when a change shows up in several columns: ITBench S3, S6, S11, S13, S14 and S15 each still fail in one of three 27B seeds.
+- *Multi-resource root causes*: S9, where Flash with thinking misses the second family.
+- *Synthetic commitment math*: commit_04 and commit_06 (thresholds, monthly vs yearly).
+- *Empty-answer tasks*: idle_05.
+- *Copying identifiers*: a row index answered instead of a resource ID, and one fabricated ID in a 125-item list.
+
+**3. Suitability as an RL base model.** Qwen3.8-27B is a **good RL base** for this domain, with caveats.
+- *For:* it already has the needed skills. Accuracy when answered is 79–86%, it never produced a parse error, it hallucinated only one ID, and a light harness takes it to 84%.
+- *Room to learn:* the remaining failures (stopping, choosing a dimension, set completeness) are behavioural and easy to verify, which is exactly what outcome-reward RL improves. Use F1 or strict set match as the reward, not the recall-only official rubric, which 27B with thinking already maxes out while adding extra resources in 40% of its answers. Add a small penalty per step, which directly targets the "won't stop" problem.
+- *Headroom:* Kimi-K3.1-Pro solves 21 of the 23 runs the 27B baseline fails under the *original* harness. That shows the reachable upper bound, and Kimi trajectories could serve as SFT warm-start data.
+- *Caveats:* 15 scenarios are far too few to train on without overfitting, and every harness number here is post-tuning. Use the deterministic generator idea below to get scale, and keep ITBench-Lite strictly held out.
+
+**4. Harbor RL environments to build** (most value first):
+1. **Cost-anomaly root cause** (the ITBench-Lite format): generate synthetic billing CSVs with an injected anomaly in a random dimension (application, instance family, service, region, tag) and with 1–N root-cause values, plus cross-column leakage so the dimension is ambiguous. Reward: exact set match of name and type, F1 for partial credit, and a step penalty. This targets weaknesses 2a and 2b directly and generates unlimited data.
+2. **Idle and waste detection with empty-answer cases**: about 20% of episodes have no idle resource, so the model learns to stop and answer `[]`.
+3. **Commitment and RI/Savings Plan math**: programmatically generated pricing tables, with numeric answers checked within tolerance. This targets the commit_* errors.
+4. **Top cost drivers / month-over-month variance** with ID-copying checks: the reward requires exact resource IDs, never row indices.
+5. **Later:** an offline aws-bench-style "estimate EC2 cost" task backed by recorded API fixtures, not live AWS, so it costs nothing.
+
+All of these are offline Python sandboxes with deterministic graders, so they are cheap, reproducible and free of reward hacking through LLM judges.
+
+**5. Next experiments** (in priority order):
+- (a) Validate the harness gains on **unseen** scenarios, such as the full ITBench FinOps set once Kubernetes is available, or freshly generated environments from recommendation 4.1. Until then, the 84–96% numbers are an upper bound.
+- (b) **Done:** 27B with thinking at medium effort scored 100% official / 60% strict, vs Flash with thinking at 95.6% / 93.3%. Next, add a precision instruction ("include only values that each explain a material share of the change") and check that strict match rises without hurting recall.
+- (c) Run a BF16 comparison on a machine with more memory.
+- (d) Run Kimi-K3.1-Pro under the improved harness, to see whether the harness gains add up with model strength.
+
