@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """Compare API models on the runs the local 8-bit baseline failed. Reads scores.jsonl only.
 Writes results/analysis/failedruns_compare.json and report_assets/failedruns_rescue.png.
-Cost = API usage tokens x Together list price (estimate, not invoice)."""
+Cost: Together models = API usage tokens x list price; Claude models = sum of per-call cost recorded in each
+trajectory (usage incl. cache write/read tokens x Anthropic list price). Both are estimates, not invoices."""
 import json
 from pathlib import Path
 import matplotlib
@@ -11,7 +12,9 @@ ROOT = Path.home() / "finops-eval"
 RES = ROOT / "results"
 MODELS = [("flash_failedruns", "Qwen3.8-Flash", 0.15, 0.47),
           ("glm53_failedruns", "GLM-5.3", 1.4, 4.4),
-          ("kimik31_failedruns", "Kimi-K3.1-Pro", 2.0, 10.0)]
+          ("kimik31_failedruns", "Kimi-K3.1-Pro", 2.0, 10.0),
+          ("sonnet55_failedruns", "Claude Sonnet 5.5", None, None),
+          ("opus55_failedruns", "Claude Opus 5.5", None, None)]
 out = {}
 for cfg, name, pin, pout in MODELS:
     out[name] = {}
@@ -35,7 +38,9 @@ for cfg, name, pin, pout in MODELS:
                             wrong_dimension=wd if b == "itbench_lite" else None,
                             mean_steps=sum(r["n_steps"] for r in rows) / len(rows),
                             mean_wall_s=sum(r["wall_s"] for r in rows) / len(rows),
-                            tokens_in=ti, tokens_out=to, est_cost_usd=round(ti * pin / 1e6 + to * pout / 1e6, 3),
+                            tokens_in=ti, tokens_out=to, est_cost_usd=round(ti * pin / 1e6 + to * pout / 1e6, 3) if pin is not None
+                            else round(sum(json.loads((RES / b / cfg / r["item"] / f"seed_{r['seed']}" / "trajectory.json").read_text())["cost_usd"]
+                                           for r in rows), 3),
                             rescued_items=sorted(f"{r['item']}:s{r['seed']}" for r in rows if r["passed"]))
 (RES / "analysis/failedruns_compare.json").write_text(json.dumps(out, indent=1))
 for m, d in out.items():
@@ -43,7 +48,7 @@ for m, d in out.items():
         print(m, b, {k: v[k] for k in v if k != "rescued_items"}, v["rescued_items"])
 # chart
 names = [m for m in out if out[m]]
-fig, ax = plt.subplots(figsize=(9, 3.6))
+fig, ax = plt.subplots(figsize=(10.5, 3.8))
 cols = {"itbench_lite": "#2a78d6", "synthetic": "#eb6834"}
 w = 0.38
 for j, b in enumerate(["itbench_lite", "synthetic"]):

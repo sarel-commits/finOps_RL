@@ -78,3 +78,8 @@
 - 02:56 Synthetic nothink_nudges_v2 finished: 99.2% ± 1.3% (128/129); only commit_06 s3 fails. 15 forced finals, all correct. REPORT §2.2 updated; charts regenerated. Chain now on itbench nothink_nudges_v2_guard (last).
 - 03:05 Per-scenario chart redrawn as a configs×scenarios heatmap (grouped bars had become unreadable with 7 configs); partial runs excluded from charts (analyze.py; backup analyze_v1_backup.py).
 - 06:21 Local chain complete (LOCAL_IMPROVE2_DONE). nothink_nudges_v2_guard: 84.4% ± 7.7% (same as without guard; different failing runs). REPORT §2.1/§2.5 status updated; charts regenerated.
+- 20:43 Launched Claude Opus 5.5 + Sonnet 5.5 on the 32 failed runs (DECISIONS #31). Logs: logs/claude_*55_failed.log
+- 20:56 Claude failed-runs done: Opus 5.5 22/23 ITB + 9/9 syn ($2.07), Sonnet 5.5 21/23 + 9/9 ($1.03). REPORT §2.3/status/§7/§9 updated, rescue chart regenerated.
+- 21:31 Added REPORT §2.6: all models × harnesses on the same 32 hard runs, from existing results only (scripts/compare_all_subset.py). Also added to EXECUTIVE_SUMMARY_HE.md. No new runs.
+- 21:39 Added cost-per-solved-run column to REPORT §2.6 and the Hebrew summary table.
+- 22:05 Added exact-answer (strict set match) columns to REPORT §2.6 and the Hebrew summary.

@@ -31,6 +31,8 @@ SAMPLING = {
     # other vendors' models: provider-default sampling (Qwen model-card values are Qwen-specific), thinking off
     "provider_nothink": dict(temperature=None, top_p=None,
                              extra_body=dict(chat_template_kwargs={"enable_thinking": False})),
+    "provider_think": dict(temperature=None, top_p=None,
+                           extra_body=dict(chat_template_kwargs={"enable_thinking": True})),
 }
 
 RUN_PYTHON_TOOL = {
@@ -169,8 +171,12 @@ class Agent:
     def __init__(self, base_url="http://127.0.0.1:8080/v1", model="default_model", protocol="native",
                  thinking=False, max_steps=20, max_tokens=None, request_timeout=1200, retries=3,
                  task_time_budget=3600, budget_nudges=False, prompt_version="v1", api_key_env=None, stream=False, sampling_profile=None, reasoning_effort=None,
-                 repeat_guard=False):
+                 repeat_guard=False, provider="openai", effort=None):
         self.base_url, self.model, self.protocol = base_url, model, protocol
+        self.provider, self.claude = provider, None
+        if provider == "anthropic":  # Claude via the official SDK (scripts/anthropic_chat.py)
+            from anthropic_chat import ClaudeChat
+            self.claude = ClaudeChat(model, effort=effort or "medium", api_key_env=api_key_env or "ANTHROPIC_API_KEY")
         self.thinking = thinking
         self.sampling_profile = sampling_profile or ("think" if thinking else "nothink")
         self.samp = copy.deepcopy(SAMPLING[self.sampling_profile])
@@ -184,10 +190,11 @@ class Agent:
                 self.samp["reasoning_effort"] = {"xhigh": "high"}.get(reasoning_effort, reasoning_effort)
         self.max_steps = max_steps
         self.max_tokens = max_tokens or (16384 if thinking else 4096)
-        api_key = os.environ[api_key_env] if api_key_env else "local"
         self.api_key_env, self.stream = api_key_env, stream
-        self.local = any(h in base_url for h in ("127.0.0.1", "localhost"))
-        self.client = openai.OpenAI(base_url=base_url, api_key=api_key, timeout=request_timeout, max_retries=0)
+        self.local = provider == "openai" and any(h in base_url for h in ("127.0.0.1", "localhost"))
+        if provider == "openai":
+            api_key = os.environ[api_key_env] if api_key_env else "local"
+            self.client = openai.OpenAI(base_url=base_url, api_key=api_key, timeout=request_timeout, max_retries=0)
         self.retries = retries
         self.task_time_budget = task_time_budget
         self.budget_nudges = budget_nudges
@@ -197,12 +204,13 @@ class Agent:
 
     def config(self):
         return dict(base_url=self.base_url, model=self.model, protocol=self.protocol, thinking=self.thinking,
-                    sampling={k: v for k, v in self.samp.items()}, max_steps=self.max_steps,
+                    sampling=({k: v for k, v in self.samp.items()} if not self.claude else "none (Claude: provider defaults; sampling params not sent)"), max_steps=self.max_steps,
                     max_tokens_per_turn=self.max_tokens, tool_timeout_s=TOOL_TIMEOUT_S,
                     task_time_budget_s=self.task_time_budget, budget_nudges=self.budget_nudges,
                     prompt_version=self.prompt_version, api_key_env=self.api_key_env, stream=self.stream,
                     sampling_profile=self.sampling_profile, reasoning_effort=self.reasoning_effort,
-                    repeat_guard=self.repeat_guard)
+                    repeat_guard=self.repeat_guard, provider=self.provider,
+                    claude=self.claude.config() if self.claude else None)
 
     def _chat(self, messages, seed, tools=True):
         kw = dict(model=self.model, messages=messages, max_tokens=self.max_tokens, seed=seed,
@@ -218,6 +226,10 @@ class Agent:
                 if self.local:
                     ensure_server(self.base_url)
                 t0 = time.time()
+                if self.claude:
+                    r = self.claude.chat(messages, [RUN_PYTHON_TOOL] if self.protocol == "native" else None,
+                                         tool_choice_none=not tools)
+                    return r, time.time() - t0
                 r = self._stream(kw) if self.stream else self.client.chat.completions.create(**kw)
                 return r, time.time() - t0
             except Exception as e:  # timeout / connection / 5xx
@@ -277,6 +289,7 @@ class Agent:
         forced_final = False
         prev_codes = []  # (step, normalized code) for repeat guard
         n_repeat_notes = 0
+        cost_usd = 0.0
         n_tool_calls = n_tool_errors = n_tool_timeouts = n_raw_parsed = 0
         t_start = time.time()
         try:
@@ -297,6 +310,9 @@ class Agent:
                 srec = dict(step=step, latency_s=round(dt, 2), prompt_tokens=pin, completion_tokens=pout,
                             finish_reason=r.choices[0].finish_reason, content=content, reasoning=reasoning,
                             tool_calls=[], observations=[])
+                if getattr(r, "usage_detail", None):
+                    srec.update(usage_detail=r.usage_detail, stop_reason=r.stop_reason, request_id=r.request_id)
+                    cost_usd += r.usage_detail["cost_usd"]
                 traj["steps"].append(srec)
                 code_list = []
                 if self.protocol == "native":
@@ -316,6 +332,8 @@ class Agent:
                     am = {"role": "assistant", "content": content}
                     if reasoning:
                         am["reasoning_content"] = reasoning
+                    if getattr(msg, "anthropic_content", None) is not None:
+                        am["_anthropic_content"] = msg.anthropic_content
                     if code_list:
                         am["tool_calls"] = [{"id": cid, "type": "function",
                                              "function": {"name": nm, "arguments": json.dumps({"code": c or ""})}}
@@ -380,12 +398,16 @@ class Agent:
                     tok_out += pout
                     content = msg.content or ""
                     reasoning = getattr(msg, "reasoning", None) or (msg.model_extra or {}).get("reasoning")
+                    if getattr(r, "usage_detail", None):
+                        cost_usd += r.usage_detail["cost_usd"]
                     traj["forced_final_step"] = dict(latency_s=round(dt, 2), prompt_tokens=pin, completion_tokens=pout,
                                                      finish_reason=r.choices[0].finish_reason, content=content,
                                                      reasoning=reasoning, tool_calls_ignored=len(msg.tool_calls or []))
                     am = {"role": "assistant", "content": content}
                     if reasoning:
                         am["reasoning_content"] = reasoning
+                    if getattr(msg, "anthropic_content", None) is not None:
+                        am["_anthropic_content"] = msg.anthropic_content
                     messages.append(am)
                     final_text, forced_final = content, True
                     err = None if extract_answer(content)[0] is not None else "forced_final_no_answer"
@@ -397,6 +419,7 @@ class Agent:
             err = "no_final"
         traj.update(status="done", error=err, forced_final=forced_final, n_repeat_notes=n_repeat_notes, final_text=final_text, answer=parsed, answer_raw=raw,
                     parse_ok=parsed is not None, tokens_in=tok_in, tokens_out=tok_out,
+                    cost_usd=round(cost_usd, 6) if self.claude else None,
                     wall_s=round(time.time() - t_start, 2), gen_s=round(gen_time, 2),
                     decode_tps_approx=round(tok_out / gen_time, 2) if gen_time else None,
                     n_steps=len(traj["steps"]), n_tool_calls=n_tool_calls, n_tool_errors=n_tool_errors,

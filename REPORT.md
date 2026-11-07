@@ -15,7 +15,7 @@
 | 4.1b Follow-up: budget nudges + prompt v2 | ⏸ stopped by user | A stopped at 10/45 runs; B and C not started (DECISIONS #21) |
 | 4.1c Failed runs on Together Qwen3.8-Flash | ✅ done | ITBench-Lite 1/23 rescued, synthetic 7/9 rescued; cost ≈ $0.74 (DECISIONS #23) |
 | — Qwen3.8-2.4T-A95B-FP8 | ⛔ unavailable | not servable on Together (DECISIONS #22) |
-| 4.1d Failed runs on GLM-5.3 / Kimi-K3.1-Pro | ✅ done (resumed) | ITBench-Lite rescued: Kimi 21/23, GLM 12/23; synthetic 9/9 both. Mistral 4 and Opus 5.5 not available (DECISIONS #24–25) |
+| 4.1d Failed runs on GLM-5.3 / Kimi-K3.1-Pro / Claude Opus 5.5 / Sonnet 5.5 | ✅ done (resumed) | ITBench-Lite rescued: **Opus 5.5 22/23**, Sonnet 5.5 21/23, Kimi 21/23, GLM 12/23; synthetic 9/9 for all four. Claude cost $2.07 (Opus) / $1.03 (Sonnet). Mistral 4 not available (DECISIONS #24–25, #31) |
 | 4.1e Harness improvements (nudges, prompt v2, repeat guard, thinking effort) | ✅ done | **Flash: 20.0% → 82.2%** (nudges + v2) **→ 95.6%** (+ thinking-medium). **27B: 48.9% → 84.4%** (nudges + v2; decision rule passed) **→ 100%** (+ thinking-medium; strict set match 60%). Post-tuning. Synthetic nudges + v2: 93.0% → 99.2%. Guard alone: no change (84.4%). All runs complete (DECISIONS #26–30) |
 | 4.2 Full ITBench FinOps | ⛔ skipped | needs Kubernetes + container runtime (see Skipped) |
 | 4.3 aws-bench | ⛔ skipped (by design) | provisions real AWS; review only |
@@ -128,19 +128,60 @@ The user asked for the failed benchmarks on `Qwen/Qwen3.8-2.4T-A95B-FP8`. Togeth
 - **Synthetic: Flash fixed 7 of 9.** It answered both commitment-math errors (commit_04, commit_06), both idle_03 timeouts, the top_drivers timeouts and the row-index entity error (top_drivers_04). It failed idle_05 in both seeds, again by searching for 20 steps when the correct answer is an empty list.
 - Flash is about 3.5× faster per ITBench-Lite run than the local 8-bit model (75 s vs 261 s), at about 3 cents per run.
 
-**Other models on the same failed runs** (DECISIONS #24–25; provider-default sampling, thinking off; otherwise identical harness). Mistral 4 is not served on Together and there is no Mistral key. Opus 5.5 was not run because there is no Anthropic API key. Raw output: `results/*/glm53_failedruns/`, `results/*/kimik31_failedruns/`. Comparison: `results/analysis/failedruns_compare.json`.
+**Other models on the same failed runs** (DECISIONS #24–25; provider-default sampling, thinking off; otherwise identical harness). Mistral 4 is not served on Together and there is no Mistral key. **Claude Opus 5.5 and Sonnet 5.5** were added later through the Anthropic API (DECISIONS #31). They use the same harness, but with **thinking on**: Opus 5.5 cannot turn it off, and both run adaptive thinking at effort `medium`. Raw output: `results/*/glm53_failedruns/`, `results/*/kimik31_failedruns/`, `results/*/opus55_failedruns/`, `results/*/sonnet55_failedruns/`. Comparison: `results/analysis/failedruns_compare.json`.
 
-| Model (Together) | ITBench-Lite rescued (n=23) | Answered | Step cap | Wrong dimension | Synthetic rescued (n=9) | Mean steps (ITB) | Mean wall (ITB) | Est. cost† |
+| Model (provider) | ITBench-Lite rescued (n=23) | Answered | Step cap | Wrong dimension | Synthetic rescued (n=9) | Mean steps (ITB) | Mean wall (ITB) | Est. cost† |
 |---|---|---|---|---|---|---|---|---|
 | Qwen3.8-Flash | 1 | 2 | 21 | 1 | 7 | 19.3 | 75 s | $0.74 |
 | GLM-5.3 | 12 | 12 | 2 | 0 | **9** | 11.6 | 114 s | $5.95 |
-| **Kimi-K3.1-Pro** | **21** | 22 | 1 | 0 | **9** | 9.7 | 88 s | $4.79 |
+| **Kimi-K3.1-Pro** (Together) | **21** | 22 | 1 | 0 | **9** | 9.7 | 88 s | $4.79 |
+| **Claude Sonnet 5.5** (Anthropic, thinking medium) | **21** | 23 | 0 | 1 | **9** | 8.8 | **22 s** | **$1.03**‡ |
+| **Claude Opus 5.5** (Anthropic, thinking medium) | **22** | 23 | 0 | 0 | **9** | **7.4** | 25 s | $2.07‡ |
 
 - **Kimi-K3.1-Pro rescues almost every ITBench-Lite failure** (21/23; it missed only S8 seed 1 and S11 seed 1), in about 10 steps, with no wrong-dimension answers. It also solves both Application-dimension scenarios (S3 and S6) in every seed where the local model failed them. A stronger model therefore *does* finish within the same 20-step harness. The step cap stops weaker models; it is not an impossible budget.
 - GLM-5.3 rescues about half (12/23). It still misses all three S6 seeds (20 Application root causes) and several S8 and S11 seeds.
 - Both GLM and Kimi fixed all 9 synthetic failures, including idle_05 (correct answer: empty list).
+- **Claude Opus 5.5 rescues the most: 22 of 23 ITBench-Lite failures plus 9 of 9 synthetic.** Every run answered, none hit the step cap and none refused. It took the fewest steps of any model (7.4), and it solved all three S6 seeds (20 Application root causes) and all three S11 seeds, which Kimi partly missed. Its only miss was S8 seed 2: it answered Instance Family `QI78eHTqNo` instead of `W4ugKNiEYE`.
+- **Claude Sonnet 5.5 ties Kimi (21/23, 9/9) at about a fifth of the cost and a quarter of the wall time.** It missed S8 seed 1, with the same wrong `QI78eHTqNo` answer as Opus, and S6 seed 1, where it listed Instance Families instead of the 20 Applications. S8 is the scenario every strong model misses at least once, so its ground truth is worth a manual check.
+- **Cost**: the 32 runs cost **$2.07 (Opus)** and **$1.03 (Sonnet)**, against $4.79 for Kimi and $5.95 for GLM, despite similar or higher list prices. Two things explain it: prompt caching (77–82% of Claude's input tokens were cache reads, billed at $0.20/M) and shorter runs.
+- **Caveat: this is not a like-for-like model ranking.** The Claude models think and the Together models did not, and these are rescue rates on the 32 hardest runs, not benchmark scores. The comparable full-benchmark numbers would need the 45 + 129 runs (not done; DECISIONS #31).
+
+‡ Exact sum of per-call costs recorded in each trajectory: API usage (uncached input, cache writes, cache reads, output including thinking tokens) × Anthropic list price (Opus 5.5 $4 / $20 / $5 / $0.20 per M; Sonnet 5.5 $2 / $10 / $2.50 / $0.20 per M). This is an estimate, not an invoice. Smoke tests added about $0.01.
 
 ![Rescue rate on failed runs](report_assets/failedruns_rescue.png)
+
+### 2.6 All models and harnesses on the same 32 hard runs (no new runs)
+
+This table compares every model and harness on the **same 32 runs**: the 23 ITBench-Lite and 9 synthetic runs that the local 27B baseline failed. It is built only from results already on disk (`scripts/compare_all_subset.py` → `results/analysis/all_models_compare.json`). Configs that were run on the full benchmark are cut down to those 32 pairs. The last column gives the full-benchmark score where one exists.
+
+| Model | Thinking | Harness | ITBench-Lite hard runs solved (of 23, official) | **Exact answers (of 23)** | Synthetic hard runs solved (of 9) | Mean steps (ITB) | Mean wall/run (ITB) | Cost, 23 ITB runs | Cost per solved run | Full ITBench-Lite official (45 runs) | **Full ITBench-Lite exact** |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen3.8-27B (local 8-bit) | off | original (v1) | 0 *(by construction)* | 0 | 0 *(by construction)* | 17.8 | 350 s | $0 | n/a (0 solved) | 48.9% | 35.6% |
+| Qwen3.8-27B (local 8-bit) | off | nudges + v2 | 18 | 10 | 8 | 13.7 | 397 s | $0 | $0 | 84.4% | 35.6% |
+| Qwen3.8-27B (local 8-bit) | off | nudges + v2 + guard | 19 | 10 | — | 13.3 | 277 s | $0 | $0 | 84.4% | 40.0% |
+| **Qwen3.8-27B (local 8-bit)** | **medium** | nudges + v2 + guard | **23** | 17 | — | 8.7 | 513 s | $0 | $0 | **100%** | 60.0% |
+| Qwen3.8-Flash (Together) | off | original (v1) | 1 | 1 | 7 | 19.3 | 75 s | $0.70 | $0.700 | 20.0% | 20.0% |
+| Qwen3.8-Flash (Together) | off | nudges + v2 | 17 | 12 | — | 16.9 | 68 s | $0.74 | $0.044 | 82.2% | 62.2% |
+| Qwen3.8-Flash (Together) | off | nudges + v2 + guard | 18 | 9 | — | 18.6 | 75 s | $0.94 | $0.052 | 82.2% | 46.7% |
+| **Qwen3.8-Flash (Together)** | **medium** | nudges + v2 + guard | **22** | **22** | — | 8.7 | 75 s | **$0.38** | **$0.017** | **95.6%** | **93.3%** |
+| GLM-5.3 (Together) | off | original (v1) | 12 | 12 | 9 | 11.6 | 114 s | $5.82 | $0.485 | — | — |
+| Kimi-K3.1-Pro (Together) | off | original (v1) | 21 | 19 | 9 | 9.7 | 88 s | $4.67 | $0.222 | — | — |
+| Claude Sonnet 5.5 (Anthropic) | medium | original (v1) | 21 | 18 | 9 | 8.8 | **22 s** | $0.95 | $0.045 | — | — |
+| **Claude Opus 5.5 (Anthropic)** | **medium** | original (v1) | **22** | **22** | 9 | **7.4** | 25 s | $1.84 | $0.084 | — | — |
+
+**Exact answers** means the answer lists exactly the ground-truth resources, nothing missing and nothing extra (strict set match). The official metric also passes answers with extra resources. The full-benchmark exact score for the Flash original-harness row comes from the full 45-run v1 config. "—" means not run. The Flash original-harness row uses the dedicated failed-runs re-run. The full 45-run v1 config, cut down to the same 23 pairs, gives 2/23 instead of 1/23, which is run-to-run noise. Costs are the same estimates as in sections 2.3 and 2.5. Cost per solved run = cost of the 23 ITBench-Lite runs ÷ runs solved. Failed runs cost money too, so this is the real price of one correct answer. The local 27B is $0 because electricity and hardware are not counted.
+
+**How to read it**
+- **With the original harness, the model is what matters.** Opus 5.5 (22), Kimi (21) and Sonnet 5.5 (21) solve almost all the hard runs. GLM-5.3 solves about half, and the two Qwen models solve almost none, mostly because they hit the 20-step cap.
+- **With the improved harness plus thinking, the Qwen models catch up.** Qwen 27B (23/23, free but about 8.5 min per run) and Qwen Flash (22/23 for $0.38) match or beat Opus 5.5 under the original harness (22/23 for $1.84).
+- **Precision separates the top models.** Opus 5.5 and Flash with thinking + best harness are exact on 22 of 22 solved runs. The 27B with thinking solves all 23 but is exact on only 17: it adds extra resources, as it does on the full benchmark (60% exact vs 100% official). Kimi (19 of 21) and Sonnet (18 of 21) also add a few extras. Without thinking, the improved harness lifts Qwen's official score much more than its exact score (27B: 18 solved, 10 exact).
+- **Thinking is worth more than the guard.** Without thinking, nudges + v2 lift Qwen to 17–19 of 23. Adding thinking takes them to 22–23 and halves the steps.
+- **Cheapest strong result: Flash with thinking + best harness** ($0.38 for 23 runs, **$0.017 per solved run**). Per solved run, it is about 2.6× cheaper than Sonnet 5.5 ($0.045), 5× cheaper than Opus 5.5 ($0.084), 13× cheaper than Kimi ($0.222) and 28× cheaper than GLM ($0.485). The local 27B costs nothing per run, but takes about 8.5 minutes each. **Fastest: the Claude models** (22–25 s per run).
+- **Gaps, so this is not a complete ranking:**
+  - GLM, Kimi and Claude were never run with the improved harness, and GLM and Kimi never with thinking.
+  - The Qwen thinking configs have no synthetic results for these pairs.
+  - The prompt v2 rows are post-tuning on these same scenarios.
+  - The subset was chosen from the 27B's failures, so it is "hard for Qwen 27B", not hard in general.
 
 ### 2.5 Harness improvements: budget nudges, prompt v2, repeat guard, thinking effort (**post-tuning**)
 
@@ -316,7 +357,7 @@ See `DECISIONS.md` for full reasoning.
 - **27B thinking at the template default (xhigh)**: stopped on user instruction (DECISIONS #18). Its partial runs are not scored. A medium-effort thinking run is in progress instead (section 2.5).
 - **Qwen3.8-2.4T-A95B-FP8**: not served by Together, either serverless or as a dedicated endpoint, and creating cloud endpoints is not allowed (DECISIONS #22).
 - **Mistral 4**: not in the Together catalog, and there is no Mistral key (DECISIONS #24).
-- **Opus 5.5**: there is no Anthropic API key, and Claude Code session credentials were deliberately not used (DECISIONS #24).
+- **Claude Opus 5.5 / Sonnet 5.5 on the full benchmarks**: run only on the 32 failed runs, as requested (DECISIONS #31).
 - **GLM-5.3 / Kimi-K3.1-Pro**: only run on the 32 failed baseline pairs, not the full benchmark, and the first attempt was stopped on user instruction (DECISIONS #25).
 
 ## 8. aws-bench review (not executed)
@@ -358,7 +399,7 @@ Reviewed `aws-bench/aws-bench` @ `ec7ec56` and `aws-bench/aws-bench-datasets` (c
 **3. Suitability as an RL base model.** Qwen3.8-27B is a **good RL base** for this domain, with caveats.
 - *For:* it already has the needed skills. Accuracy when answered is 79–86%, it never produced a parse error, it hallucinated only one ID, and a light harness takes it to 84%.
 - *Room to learn:* the remaining failures (stopping, choosing a dimension, set completeness) are behavioural and easy to verify, which is exactly what outcome-reward RL improves. Use F1 or strict set match as the reward, not the recall-only official rubric, which 27B with thinking already maxes out while adding extra resources in 40% of its answers. Add a small penalty per step, which directly targets the "won't stop" problem.
-- *Headroom:* Kimi-K3.1-Pro solves 21 of the 23 runs the 27B baseline fails under the *original* harness. That shows the reachable upper bound, and Kimi trajectories could serve as SFT warm-start data.
+- *Headroom:* Claude Opus 5.5 solves 22 and Kimi-K3.1-Pro and Claude Sonnet 5.5 each solve 21 of the 23 runs the 27B baseline fails under the *original* harness. That shows the reachable upper bound, and their trajectories could serve as SFT warm-start data.
 - *Caveats:* 15 scenarios are far too few to train on without overfitting, and every harness number here is post-tuning. Use the deterministic generator idea below to get scale, and keep ITBench-Lite strictly held out.
 
 **4. Harbor RL environments to build** (most value first):

@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calibration Monitor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--ink:#1d1d1b;--mute:#6b6b66;--line:#e4e4df;
+  --c1:#2a6fdb;--c2:#e07a1f;--c3:#2e9e6b;--c4:#b8476b;--c5:#7a5cc4;--bad:#c2410c}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--card:#1e1e1c;--ink:#ecebe6;--mute:#9a9a93;--line:#2f2f2c;
+  --c1:#6b9ff0;--c2:#f0a050;--c3:#5cc596;--c4:#e07a9c;--c5:#a48ce6;--bad:#fb923c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1280px;margin:0 auto;padding:20px 16px 40px}
+header{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+h1{font-size:20px;margin:0;font-weight:600}
+.sub{color:var(--mute);font-size:13px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.kpi .v{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
+.kpi .l{color:var(--mute);font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}
+.card h2{font-size:13px;font-weight:600;margin:0 0 2px}
+.card p{margin:0 0 8px;color:var(--mute);font-size:12px}
+.cv{position:relative;height:230px}
+pre{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/1.4 ui-monospace,Menlo,monospace;color:var(--mute)}
+table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+td,th{padding:3px 6px;border-bottom:1px solid var(--line);text-align:left}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--c3)}
+.dot.warn{background:var(--bad)}
+@media (max-width:440px){.grid{grid-template-columns:1fr}}
+h2.sec{font-size:15px;font-weight:600;margin:22px 0 10px}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div><h1>Calibration monitor</h1>
+  <div class="sub">Qwen3.8-27B (bf16, vLLM) on 1×H100 · finops-rca · 200 train tasks × 8 + ITBench-Lite 15 × 8</div></div>
+  <div class="sub"><span id="dot" class="dot"></span><span id="status">loading…</span></div>
+</header>
+<section id="trainSec" style="display:none">
+  <h2 class="sec">Training: GRPO, LoRA on Qwen3.8-27B-FP8, 1×H100</h2>
+  <div class="kpis" id="tkpis"></div>
+  <div class="grid">
+    <div class="card"><h2>Train episodes per step</h2><p>Share of the step's episodes (T = 1.0 sampling)</p><div class="cv"><canvas id="tq"></canvas></div></div>
+    <div class="card"><h2>ITBench-Lite eval</h2><p>15 real scenarios, model-card sampling · step 0 = before training</p><div class="cv"><canvas id="te"></canvas></div></div>
+    <div class="card"><h2>Mean reward per step</h2><p>0.5·F1 + 0.5·exact, train episodes</p><div class="cv"><canvas id="tr"></canvas></div></div>
+    <div class="card"><h2>Optimization</h2><p>Gradient norm and train-vs-vLLM log-prob gap (per token)</p><div class="cv"><canvas id="to"></canvas></div></div>
+    <div class="card"><h2>Time per step</h2><p>Rollouts vs training, minutes</p><div class="cv"><canvas id="tt"></canvas></div></div>
+    <div class="card"><h2>Learning signal</h2><p>Groups whose 8 rewards differ (the rest are skipped)</p><div class="cv"><canvas id="tg"></canvas></div></div>
+    <div class="card" style="grid-column:1/-1"><h2>Trainer log (tail)</h2><pre id="tlog"></pre></div>
+  </div>
+  <h2 class="sec">Calibration</h2>
+</section>
+<div class="kpis" id="kpis"></div>
+<div class="grid">
+  <div class="card"><h2>Quality as rollouts complete (train)</h2><p>Cumulative share of finished rollouts</p><div class="cv"><canvas id="cq"></canvas></div></div>
+  <div class="card"><h2>Throughput</h2><p>Rollouts finished per hour (rolling 15 min)</p><div class="cv"><canvas id="ct"></canvas></div></div>
+  <div class="card"><h2>vLLM load</h2><p>Generated tokens/s and requests in flight</p><div class="cv"><canvas id="cv"></canvas></div></div>
+  <div class="card"><h2>GPU</h2><p>Utilization, memory, KV-cache use (%)</p><div class="cv"><canvas id="cg"></canvas></div></div>
+  <div class="card"><h2>Pass rate by mechanism (train)</h2><p>exact = 1; label shows rollouts done</p><div class="cv"><canvas id="cm"></canvas></div></div>
+  <div class="card"><h2>Tool steps used</h2><p>Solved vs not, per rollout (20 = budget hit)</p><div class="cv"><canvas id="cs"></canvas></div></div>
+  <div class="card"><h2>Per-task pass rate (complete tasks, k=8)</h2><p>GRPO learns only from 0 &lt; pass &lt; 1</p><div class="cv"><canvas id="cp"></canvas></div></div>
+  <div class="card"><h2>ITBench-Lite (eval, real scenarios)</h2><p>Per scenario: solved / done</p><div id="itb"><p>not started</p></div></div>
+  <div class="card" style="grid-column:1/-1"><h2>Run log (tail)</h2><pre id="log"></pre></div>
+</div>
+</main>
+<script>
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C = () => ({c1:css('--c1'),c2:css('--c2'),c3:css('--c3'),c4:css('--c4'),c5:css('--c5'),mute:css('--mute'),line:css('--line'),ink:css('--ink')});
+Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+Chart.defaults.animation = false;
+const charts = {};
+function mk(id, type, opts={}) {
+  const c = C();
+  Chart.defaults.color = c.mute; Chart.defaults.borderColor = c.line;
+  charts[id] = new Chart(document.getElementById(id), {type, data:{labels:[],datasets:[]},
+    options: Object.assign({responsive:true, maintainAspectRatio:false, interaction:{mode:'index',intersect:false},
+      plugins:{legend:{labels:{boxWidth:10,boxHeight:10}}}}, opts)});
+}
+const timeX = {type:'linear', ticks:{callback:v=>new Date(v*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}), maxTicksLimit:6}};
+mk('cq','line',{scales:{x:{type:'linear',title:{display:true,text:'rollouts finished'}},y:{min:0,max:100,ticks:{callback:v=>v+'%'}}}});
+mk('ct','line',{scales:{x:timeX,y:{beginAtZero:true}}});
+mk('cv','line',{scales:{x:timeX,y:{beginAtZero:true,position:'left',title:{display:true,text:'tok/s'}},y2:{beginAtZero:true,position:'right',grid:{drawOnChartArea:false},title:{display:true,text:'requests'}}}});
+mk('cg','line',{scales:{x:timeX,y:{min:0,max:100}}});
+mk('cm','bar',{indexAxis:'y',scales:{x:{min:0,max:100,ticks:{callback:v=>v+'%'}}},plugins:{legend:{display:false}}});
+mk('cs','bar',{scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true}}});
+mk('cp','bar',{scales:{y:{beginAtZero:true,ticks:{precision:0}}},plugins:{legend:{display:false}}});
+
+const stepX = {type:'linear', title:{display:true, text:'step'}, ticks:{precision:0}};
+mk('tq','line',{scales:{x:stepX, y:{min:0,max:100,ticks:{callback:v=>v+'%'}}}});
+mk('te','line',{scales:{x:stepX, y:{min:0,max:100,ticks:{callback:v=>v+'%'}}}});
+mk('tr','line',{scales:{x:stepX, y:{min:0,max:1}}});
+mk('to','line',{scales:{x:stepX, y:{beginAtZero:true,title:{display:true,text:'grad norm'}}, y2:{beginAtZero:true,position:'right',grid:{drawOnChartArea:false},title:{display:true,text:'|Δ log-prob|'}}}});
+mk('tt','bar',{scales:{x:{stacked:true,title:{display:true,text:'step'}}, y:{stacked:true,beginAtZero:true}}});
+mk('tg','bar',{scales:{x:{title:{display:true,text:'step'}}, y:{beginAtZero:true,ticks:{precision:0}}},plugins:{legend:{display:false}}});
+
+function renderTrain(d) {
+  const tm = d.train_metrics || [], ev = d.train_eval || [];
+  const sec = document.getElementById('trainSec');
+  if (!tm.length && !ev.length) { sec.style.display = 'none'; return; }
+  if (sec.style.display === 'none') { sec.style.display = ''; ['tq','te','tr','to','tt','tg'].forEach(k => charts[k].resize()); }
+  const c = C(), last = tm[tm.length-1] || {}, le = ev[ev.length-1];
+  const p = x => x == null ? '–' : (100*x).toFixed(1) + '%';
+  const avgStep = tm.length ? tm.reduce((s,m)=>s+m.t_step,0)/tm.length : null;
+  const k = [
+    [tm.length ? `${last.step+1}` : '0', 'steps done'],
+    [p(last.pass_rate), 'train pass (last step)'],
+    [last.reward != null ? last.reward.toFixed(3) : '–', 'train reward (last step)'],
+    [p(last.answered), 'answered (last step)'],
+    [le ? p(le.pass_rate) : '–', le ? `ITBench-Lite @ step ${le.step}` : 'ITBench-Lite'],
+    [ev.length ? p(ev[0].pass_rate) : '–', 'ITBench-Lite before training'],
+    [avgStep ? (avgStep/60).toFixed(1) + ' min' : '–', 'avg time / step'],
+    [last.informative_groups != null ? `${last.informative_groups}/${last.groups}` : '–', 'groups with signal'],
+  ];
+  document.getElementById('tkpis').innerHTML = k.map(([v,l]) => `<div class="kpi"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
+  const S = key => tm.map(m => ({x:m.step, y: m[key] == null ? null : 100*m[key]}));
+  charts.tq.data.datasets = [line('pass (exact)', S('pass_rate'), c.c3, {pointRadius:2}), line('answered', S('answered'), c.c1, {pointRadius:2}),
+                             line('hit 20-step budget', S('hit_budget'), c.c2, {pointRadius:2})];
+  charts.tq.update();
+  charts.te.data.datasets = [line('pass (exact)', ev.map(e=>({x:e.step,y:100*e.pass_rate})), c.c3, {pointRadius:4}),
+                             line('answered', ev.map(e=>({x:e.step,y:100*e.answered})), c.c1, {pointRadius:4})];
+  charts.te.update();
+  charts.tr.data.datasets = [line('mean reward', tm.map(m=>({x:m.step,y:m.reward})), c.c5, {pointRadius:2})];
+  charts.tr.update();
+  charts.to.data.datasets = [line('grad norm', tm.map(m=>({x:m.step,y:m.grad_norm})), c.c4, {pointRadius:2}),
+                             line('|Δ log-prob|', tm.map(m=>({x:m.step,y:m.mismatch})), c.c1, {pointRadius:2, yAxisID:'y2'})];
+  charts.to.update();
+  charts.tt.data.labels = tm.map(m=>m.step);
+  charts.tt.data.datasets = [{label:'rollouts', data: tm.map(m=>m.t_rollout/60), backgroundColor:c.c1},
+                             {label:'training', data: tm.map(m=>m.t_train/60), backgroundColor:c.c2}];
+  charts.tt.update();
+  charts.tg.data.labels = tm.map(m=>m.step);
+  charts.tg.data.datasets = [{data: tm.map(m=>m.informative_groups), backgroundColor:c.c3, borderRadius:3}];
+  charts.tg.update();
+  document.getElementById('tlog').textContent = d.train_log || '';
+}
+
+const pct = (a,b) => b ? (100*a/b) : 0;
+const f1 = x => x.toFixed(1);
+function line(label, data, color, extra={}) { return Object.assign({label, data, borderColor:color, backgroundColor:color, borderWidth:2, pointRadius:0, tension:.25}, extra); }
+
+function render(d) {
+  const c = C();
+  const tr = d.rollouts.train || [], itb = d.rollouts.itbench_lite || [];
+  const all = tr.concat(itb), total = d.total.train + d.total.itbench_lite;
+  const ok = d.status === 'ok';
+  document.getElementById('dot').className = 'dot' + (ok ? '' : ' warn');
+  document.getElementById('status').textContent = `${d.status} · updated ${new Date(d.updated*1000).toLocaleTimeString()}`;
+  document.getElementById('log').textContent = d.log || '';
+
+  // throughput
+  const times = all.map(r => r.t).sort((a,b)=>a-b);
+  const now = d.updated, win = 900;
+  const recent = times.filter(t => t > now - win).length;
+  const rate = times.length > 1 ? (times.length - 1) / Math.max(60, times[times.length-1] - times[0]) * 3600 : 0;
+  const rateNow = recent / win * 3600 || rate;
+  const left = total - all.length;
+  const eta = rateNow ? left / rateNow : null;
+
+  const n = tr.length, sum = k => tr.reduce((s,r)=>s+r[k],0);
+  const kp = [
+    [`${all.length} / ${total}`, 'rollouts finished'],
+    [n ? f1(pct(sum('exact'), n)) + '%' : '–', 'train pass (exact)'],
+    [n ? (tr.reduce((s,r)=>s+0.5*r.f1+0.5*r.exact,0)/n).toFixed(3) : '–', 'train mean reward'],
+    [n ? f1(pct(sum('format_ok'), n)) + '%' : '–', 'answered in budget'],
+    [n ? f1(pct(tr.filter(r=>r.error==='max_steps').length, n)) + '%' : '–', 'hit 20-step budget'],
+    [itb.length ? `${f1(pct(itb.reduce((s,r)=>s+r.exact,0), itb.length))}%` : '–', 'ITBench-Lite pass'],
+    [rateNow ? Math.round(rateNow) : '–', 'rollouts / hour'],
+    [eta != null ? (eta >= 1 ? f1(eta) + ' h' : Math.round(eta*60) + ' min') : '–', 'ETA'],
+    [all.reduce((s,r)=>s+(r.audit?1:0),0), 'audit-flagged'],
+  ];
+  document.getElementById('kpis').innerHTML = kp.map(([v,l]) => `<div class="kpi"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
+
+  // cumulative quality
+  const ord = tr.slice().sort((a,b)=>a.t-b.t);
+  let e=0, a=0, m=0; const pe=[], pa=[], pm=[];
+  ord.forEach((r,i) => { e+=r.exact; a+=r.format_ok; m+=r.error==='max_steps'; const k=i+1;
+    pe.push({x:k,y:100*e/k}); pa.push({x:k,y:100*a/k}); pm.push({x:k,y:100*m/k}); });
+  charts.cq.data.datasets = [line('pass (exact)', pe, c.c3), line('answered', pa, c.c1), line('hit budget', pm, c.c2)];
+  charts.cq.update();
+
+  // throughput series
+  const tp = [];
+  for (let t = times[0]; times.length && t <= now; t += 60) tp.push({x:t, y: times.filter(x => x > t - win && x <= t).length / win * 3600});
+  charts.ct.data.datasets = [line('rollouts/h', tp, c.c5, {fill:false})];
+  charts.ct.update();
+
+  // vLLM + GPU
+  const s = d.series || [];
+  charts.cv.data.datasets = [
+    line('gen tok/s', s.filter(p=>p.gen_tps!=null).map(p=>({x:p.t,y:p.gen_tps})), c.c1),
+    line('running', s.filter(p=>p.running!=null).map(p=>({x:p.t,y:p.running})), c.c3, {yAxisID:'y2'}),
+    line('waiting', s.filter(p=>p.waiting!=null).map(p=>({x:p.t,y:p.waiting})), c.c2, {yAxisID:'y2'})];
+  charts.cv.update();
+  charts.cg.data.datasets = [
+    line('GPU util', s.filter(p=>p.gpu_util!=null).map(p=>({x:p.t,y:p.gpu_util})), c.c4),
+    line('GPU mem', s.filter(p=>p.gpu_mem!=null).map(p=>({x:p.t,y:p.gpu_mem})), c.c5),
+    line('KV cache', s.filter(p=>p.kv!=null).map(p=>({x:p.t,y:p.kv*100})), c.c1)];
+  charts.cg.update();
+
+  // mechanism
+  const mech = {};
+  tr.forEach(r => { const k = `${r.regime}/${r.mechanism}`; (mech[k] ||= {n:0,e:0}); mech[k].n++; mech[k].e += r.exact; });
+  const mk_ = Object.keys(mech).sort((x,y)=>pct(mech[y].e,mech[y].n)-pct(mech[x].e,mech[x].n));
+  charts.cm.data.labels = mk_.map(k => `${k} (${mech[k].n})`);
+  charts.cm.data.datasets = [{data: mk_.map(k => pct(mech[k].e, mech[k].n)), backgroundColor: c.c3, borderRadius:3}];
+  charts.cm.update();
+
+  // steps histogram
+  const lab = Array.from({length:21},(_,i)=>i), sv = lab.map(()=>0), fv = lab.map(()=>0);
+  tr.forEach(r => { const i = Math.min(20, r.steps); (r.exact ? sv : fv)[i]++; });
+  charts.cs.data.labels = lab;
+  charts.cs.data.datasets = [{label:'solved',data:sv,backgroundColor:c.c3},{label:'not solved',data:fv,backgroundColor:c.c2}];
+  charts.cs.update();
+
+  // per-task pass distribution
+  const byT = {}; tr.forEach(r => { (byT[r.task_id] ||= []).push(r.exact); });
+  const comp = Object.values(byT).filter(v => v.length >= 8);
+  const bins = Array.from({length:9},()=>0); comp.forEach(v => bins[v.reduce((x,y)=>x+y,0)]++);
+  charts.cp.data.labels = bins.map((_,i)=>`${i}/8`);
+  charts.cp.data.datasets = [{data:bins, backgroundColor: bins.map((_,i)=> i===0||i===8 ? c.mute : c.c1), borderRadius:3}];
+  const inf = comp.filter(v => { const p=v.reduce((x,y)=>x+y,0); return p>0 && p<8; }).length;
+  charts.cp.options.plugins.title = {display:true, text:`${comp.length} complete tasks · ${inf} informative`, color:c.ink};
+  charts.cp.update();
+
+  // ITBench table
+  if (itb.length) {
+    const g = {}; itb.forEach(r => { (g[r.task_id] ||= {n:0,e:0,f:0}); g[r.task_id].n++; g[r.task_id].e+=r.exact; g[r.task_id].f+=r.f1; });
+    const ks = Object.keys(g).sort((x,y)=>parseInt(x.split('-').pop())-parseInt(y.split('-').pop()));
+    document.getElementById('itb').innerHTML = '<table><tr><th>scenario</th><th>solved</th><th>mean F1</th></tr>' +
+      ks.map(k => `<tr><td>${k.replace('itbench_lite-','')}</td><td>${g[k].e} / ${g[k].n}</td><td>${(g[k].f/g[k].n).toFixed(2)}</td></tr>`).join('') + '</table>';
+  }
+}
+async function tick() {
+  try { const r = await fetch('data.json?' + Date.now()); if (r.ok) { const d = await r.json(); renderTrain(d); render(d); } }
+  catch (e) { document.getElementById('status').textContent = 'waiting for first sync…'; }
+}
+tick(); setInterval(tick, 15000);
+</script>
+</body>
+</html>

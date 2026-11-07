@@ -77,12 +77,16 @@ def main():
     ap.add_argument("--api-key-env", default=None, help="name of env var holding the API key (value never logged)")
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--retries", type=int, default=3)
-    ap.add_argument("--sampling-profile", default=None, choices=["nothink", "think", "provider_nothink"])
+    ap.add_argument("--sampling-profile", default=None, choices=["nothink", "think", "provider_nothink", "provider_think"])
     ap.add_argument("--reasoning-effort", default=None, choices=["low", "medium", "xhigh"],
                     help="Qwen3.8 chat-template reasoning_effort (thinking mode only); template default is xhigh")
     ap.add_argument("--repeat-guard", action="store_true",
                     help="append a note to the observation when code is >=90%% similar to an earlier call")
     ap.add_argument("--only-pairs", nargs="*", default=None, help="exact item:seed pairs to run")
+    ap.add_argument("--provider", default="openai", choices=["openai", "anthropic"],
+                    help="anthropic = Claude via the official SDK (scripts/anthropic_chat.py)")
+    ap.add_argument("--effort", default=None, choices=["low", "medium", "high", "xhigh", "max"],
+                    help="Claude output_config.effort (adaptive thinking)")
     a = ap.parse_args()
     out = ROOT / "results" / a.bench / a.config
     out.mkdir(parents=True, exist_ok=True)
@@ -90,7 +94,7 @@ def main():
                   budget_nudges=a.budget_nudges, prompt_version=a.prompt_version,
                   base_url=a.base_url, model=a.model, api_key_env=a.api_key_env, stream=a.stream, retries=a.retries,
                   sampling_profile=a.sampling_profile, reasoning_effort=a.reasoning_effort,
-                  repeat_guard=a.repeat_guard)
+                  repeat_guard=a.repeat_guard, provider=a.provider, effort=a.effort)
     cfg = dict(bench=a.bench, config=a.config, seeds=a.seeds, model_label=a.model_label, agent=agent.config(),
                itbench_prompt_template=(ITB_PROMPT_V2 if a.prompt_version == "v2" else ITB_PROMPT) if a.bench == "itbench_lite" else None,
                started=time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -109,7 +113,7 @@ def main():
                            meta=dict(item=iid, bench=a.bench, config=a.config, model=a.model_label))
             print(f"[{a.config}] seed={seed} {iid}: status={tr['status']} err={tr.get('error')} "
                   f"steps={tr.get('n_steps')} forced={tr.get('forced_final', False)} ans={json.dumps(tr.get('answer'))[:120]} "
-                  f"tok_in={tr.get('tokens_in')} tok_out={tr.get('tokens_out')} wall={tr.get('wall_s')}s "
+                  f"tok_in={tr.get('tokens_in')} tok_out={tr.get('tokens_out')} cost=${tr.get('cost_usd')} wall={tr.get('wall_s')}s "
                   f"({time.time()-t0:.0f}s)", flush=True)
 
 
