@@ -96,11 +96,43 @@ labels; naive top-delta solves 30% of clean / 96% of noisy tasks (~50% overall; 
   tasks (`HarborTaskset`). `export_harbor.py` produces Harbor tasks so other agents/models can be benchmarked on
   the same eval set. The local verifier check passes (gold 1.0, wrong 0.0); not run under Docker here (no Docker).
 
+## Single-GPU training (1×H100): `scripts/train_grpo_unsloth.py`
+
+prime-rl needs at least 2 GPUs for RL (trainer and inference on separate GPUs: `partition_gpus` refuses otherwise), and
+its trainer keeps bf16 weights even with FP8 compute. On one H100 the trainer is a small GRPO loop on Unsloth, where
+vLLM and the trainer share one copy of **`Qwen/Qwen3.8-27B-FP8`** (official block-FP8, ~29 GB) and vLLM frees its KV
+cache while the trainer runs. The environment is unchanged (generator, sandbox, reward, prompts, episode protocol).
+
+* Rollouts: token-in/token-out, multi-turn, all episodes batched per turn; the trained sequence is exactly what vLLM
+  sampled plus the chat-template tokens of tool results (masked). Train sampling T=1.0; eval uses model-card sampling.
+* Loss: advantage = reward - group mean; zero-variance groups skipped; token-level policy gradient with a truncated
+  importance weight vs vLLM's log-probs (FP8 serving kernels differ slightly from training kernels); AdamW on LoRA
+  (r=16, all attention/MLP + GatedDeltaNet projections, 108.8M params, fp32 master weights).
+* Run on the instance: `~/run_train.sh ~/train.log --tasks-per-step 6 --group 8 --steps 40 --eval-every 10`;
+  smoke test: `--smoke`. Live charts: `python3 rl/scripts/aws/dashboard.py` (http://127.0.0.1:8765).
+
+Findings from getting it to run (2026-11-07):
+* bf16 27B does not serve on one H100 with default vLLM settings: weights take 50 GiB and the CUDA-graph memory
+  profiling for 512 concurrent sequences (each holding ~150 MB of fp32 linear-attention state) runs out of memory.
+  FP8 leaves 37.4 GiB of KV cache (492k tokens, 15 concurrent 32k-token sequences).
+* A pre-quantized FP8 checkpoint must be loaded with `load_in_fp8=False` (as-is); `True` adds vLLM online FP8 on top.
+* vLLM serves the VLM class (`language_model.model.layers.N`), the trainer is text-only (`model.layers.N`): LoRA keys
+  are renamed to the checkpoint layout `model.language_model.layers.N` before the hand-off, then Unsloth's
+  servability check runs, so a silently ignored adapter (rollouts from the base model) is impossible. vLLM wraps all
+  targets, including the GatedDeltaNet `in_proj_qkv`/`in_proj_z` (packed `in_proj_qkvz`) and `out_proj`.
+* Token alignment check: |log p_train - log p_vLLM| = 0.02 nats/token on the sampled tokens (misalignment would be
+  orders of magnitude larger).
+* Training memory peaks at 78.9 GB on a 31.6k-token episode, so episodes > 28k tokens are not backpropagated
+  (`--train-max-tokens`; they still count in group means) and an OOM skips the episode instead of the run.
+* After the first step's Triton autotuning, training costs ~0.36 ms/token; rollouts dominate the step time.
+
 ## Not done / to verify on the GPU node
 
 * The prime-rl TOML has not been schema-validated (installing `prime-rl-configs` was not permitted in this session);
   fields marked `VERIFY` are assumptions (optimizer type name, renderer name/thinking flag, model id).
-* `bwrap` backend is written but untested here (macOS); test it on the node before training.
+* `bwrap` backend: tested on Linux (AWS p5.4xlarge, Ubuntu 22.04): 34/34 tests pass, `vf-validate` 3/3.
+* Harbor export pins pandas 2.2.3 / numpy 2.1.3, but the baseline eval and the training sandbox use pandas 3.1.1 /
+  numpy 2.5.4; align the Dockerfile before using Harbor numbers next to these.
 * Calibration so far: a 4-task x 2-sample smoke run on the local 8-bit model (`results/calibration/train/`):
   2/8 exact, 2/4 tasks informative (0 < pass < 1), 3/8 rollouts hit the 20-step budget without answering,
   no audit flags, ~13 min/rollout.

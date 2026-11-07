@@ -64,6 +64,8 @@ def parse_args():
     ap.add_argument("--max-steps", type=int, default=20, help="tool-step budget per episode (eval protocol)")
     ap.add_argument("--max-turn-tokens", type=int, default=4096)
     ap.add_argument("--tis-cap", type=float, default=2.0)
+    ap.add_argument("--train-max-tokens", type=int, default=28000,
+                    help="episodes longer than this are not backpropagated (activation memory)")
     ap.add_argument("--logp-chunk", type=int, default=1024)
     ap.add_argument("--eval-every", type=int, default=10, help="ITBench-Lite eval every N steps (0 = off)")
     ap.add_argument("--eval-samples", type=int, default=1)
@@ -74,6 +76,8 @@ def parse_args():
     ap.add_argument("--out", default=str(RL / "results" / "train"))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--deadline", type=float, default=0.0,
+                    help="unix time; no new step starts unless it plus a final eval + checkpoint fit before it")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     if a.smoke:
@@ -135,7 +139,10 @@ def main():
     a = parse_args()
     from unsloth import FastModel                 # before transformers / peft
     import torch
+    from concurrent.futures import FIRST_COMPLETED, wait
     from vllm import SamplingParams
+    from vllm.sampling_params import RequestOutputKind
+    FINAL_ONLY = RequestOutputKind.FINAL_ONLY     # engine.step() returns a request only once, when finished
 
     from finops_gym import tasks as T
     from finops_gym.generator import materialize
@@ -255,7 +262,34 @@ def main():
                 outs.append(e.sb.run_python(code).output)
         return outs
 
+    def on_turn(e, c):
+        """Append one sampled turn to the episode; returns the tool calls to run, or None if the episode ended."""
+        turn = e.turns                                 # index of this model turn (0..max_steps)
+        gen = list(c.token_ids)
+        lps = [c.logprobs[i][t].logprob for i, t in enumerate(gen)] if c.logprobs else [0.0] * len(gen)
+        e.ids += gen
+        e.mask += [1] * len(gen)
+        e.vlp += lps
+        e.turns += 1
+        stopped = bool(gen) and gen[-1] in STOP_IDS
+        content, calls = parse_tool_calls(tok.decode(gen[:-1] if stopped else gen, skip_special_tokens=False))
+        if not calls:
+            e.final, e.done = content, True
+            return None
+        if turn == a.max_steps:                        # budget exhausted while still calling tools
+            e.err, e.done = "max_steps", True
+            return None
+        if not stopped:                                # complete call(s) but the turn ran to the length cap
+            e.ids.append(IM_END)
+            e.mask.append(0)
+            e.vlp.append(0.0)
+        e.steps += 1
+        return calls
+
     def rollout(eps, sp_for, lora_req):
+        """Asynchronous multi-turn rollouts: every episode advances on its own. When one episode's turn finishes its
+        tool calls run in a thread and its next turn is queued, while vLLM keeps decoding the others (a lock-step
+        version waited each turn for the slowest of all episodes: ~65 s/turn at 48 episodes)."""
         for e in eps:
             e.sb = Sandbox(SandboxConfig())
             materialize(e.task, e.sb.workdir)
@@ -265,52 +299,59 @@ def main():
         if sleep_mode:
             torch.cuda.empty_cache()                   # hand the trainer's cached blocks back before vLLM re-maps KV
             llm.wake_up()
+        eng = llm.llm_engine
+        pending, alias, tools = {}, {}, {}
+        counter = [0]
+
+        def submit(e):
+            room = a.max_seq_len - len(e.ids)
+            if room < 256:
+                e.done, e.err = True, "context"
+                return
+            rid = f"r{counter[0]}"
+            counter[0] += 1
+            got = eng.add_request(rid, {"prompt_token_ids": list(e.ids)},
+                                  sp_for(min(a.max_turn_tokens, room), e, e.turns), lora_request=lora_req)
+            pending[rid] = e
+            if isinstance(got, str) and got != rid:
+                alias[got] = rid
+
+        t0, last_log = time.time(), time.time()
         try:
-            for turn in range(a.max_steps + 1):
-                live, reqs, sps = [], [], []
-                for e in eps:
-                    if e.done:
-                        continue
-                    room = a.max_seq_len - len(e.ids)
-                    if room < 256:
-                        e.done, e.err = True, "context"
-                        continue
-                    live.append(e)
-                    reqs.append({"prompt_token_ids": list(e.ids)})
-                    sps.append(sp_for(min(a.max_turn_tokens, room), e, turn))
-                if not live:
-                    break
-                outs = llm.generate(reqs, sps, lora_request=lora_req, use_tqdm=False)
-                jobs = []
-                for e, o in zip(live, outs):
-                    c = o.outputs[0]
-                    gen = list(c.token_ids)
-                    lps = [c.logprobs[i][t].logprob for i, t in enumerate(gen)] if c.logprobs else [0.0] * len(gen)
-                    e.ids += gen
-                    e.mask += [1] * len(gen)
-                    e.vlp += lps
-                    e.turns += 1
-                    stopped = bool(gen) and gen[-1] in STOP_IDS
-                    content, calls = parse_tool_calls(tok.decode(gen[:-1] if stopped else gen,
-                                                                 skip_special_tokens=False))
-                    if not calls:
-                        e.final, e.done = content, True
-                        continue
-                    if turn == a.max_steps:            # budget exhausted while still calling tools
-                        e.err, e.done = "max_steps", True
-                        continue
-                    if not stopped:                    # complete call(s) but the turn ran to the length cap
-                        e.ids.append(IM_END)
-                        e.mask.append(0)
-                        e.vlp.append(0.0)
-                    e.steps += 1
-                    jobs.append((e, calls))
-                for (e, _), outs_ in zip(jobs, pool.map(run_tools, jobs)):
+            for e in eps:
+                submit(e)
+            while pending or tools:
+                if pending:
+                    for out in eng.step():
+                        if not out.finished:
+                            continue
+                        e = pending.pop(alias.pop(out.request_id, out.request_id), None)
+                        if e is None:
+                            continue
+                        calls = on_turn(e, out.outputs[0])
+                        if calls:
+                            tools[pool.submit(run_tools, (e, calls))] = (e, len(calls))
+                else:
+                    wait(list(tools), return_when=FIRST_COMPLETED)
+                for f in [f for f in tools if f.done()]:
+                    e, n_calls = tools.pop(f)
+                    try:
+                        outs_ = f.result()
+                    except Exception as ex:            # a tool failure must not kill the step
+                        outs_ = [f"[error: tool execution failed: {type(ex).__name__}]"] * n_calls
                     dlt = tool_delta(outs_)
                     e.ids += dlt
                     e.mask += [0] * len(dlt)
                     e.vlp += [0.0] * len(dlt)
+                    submit(e)
+                if time.time() - last_log > 120:
+                    last_log = time.time()
+                    nd = sum(e.done for e in eps)
+                    log(f"  rollout {time.time() - t0:.0f}s: {nd}/{len(eps)} episodes done, {len(pending)} generating, "
+                        f"{len(tools)} running tools, mean turns {sum(e.turns for e in eps) / len(eps):.1f}")
         finally:
+            if pending:
+                eng.abort_request(list(pending))
             if sleep_mode:
                 llm.sleep(1)
             for e in eps:
@@ -322,12 +363,12 @@ def main():
 
     def train_sp(max_tokens, e, turn):
         return SamplingParams(temperature=1.0, top_p=1.0, max_tokens=max_tokens, logprobs=0,
-                              stop_token_ids=STOP_IDS, skip_special_tokens=False)
+                              stop_token_ids=STOP_IDS, skip_special_tokens=False, output_kind=FINAL_ONLY)
 
     def eval_sp(max_tokens, e, turn):                  # model-card sampling, as in the baseline eval
         return SamplingParams(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0, presence_penalty=1.5,
                               repetition_penalty=1.0, max_tokens=max_tokens, stop_token_ids=STOP_IDS,
-                              skip_special_tokens=False, seed=(e.sample + 1) * 1000 + turn)
+                              skip_special_tokens=False, seed=(e.sample + 1) * 1000 + turn, output_kind=FINAL_ONLY)
 
     def ep_record(e, step, kind):
         r = e.rw
@@ -351,33 +392,51 @@ def main():
                           for i in range(0, h.shape[0], a.logp_chunk)])
 
     def train_on(eps):
-        batch = [e for e in eps if abs(e.adv) > 1e-8]
+        signal = [e for e in eps if abs(e.adv) > 1e-8]
+        # Activation memory peaks near the 80 GB limit at ~31k tokens (smoke test: 78.9 GB), so very long episodes are
+        # not backpropagated (they still count in the group means). Almost all of them are budget-exhausted failures.
+        batch = [e for e in signal if len(e.ids) <= a.train_max_tokens]
+        skipped_long = len(signal) - len(batch)
         n_tok = sum(sum(e.mask) for e in batch)
+        empty = dict(loss=0.0, grad_norm=0.0, mismatch=None, tis_clipped=None, trained_eps=0, trained_tokens=0,
+                     skipped_long=skipped_long, oom=0)
         if not batch:
-            return dict(loss=0.0, grad_norm=0.0, mismatch=None, tis_clipped=None, trained_eps=0, trained_tokens=0)
+            return empty
         model.train()
-        loss_sum, mm_sum, clip_n = 0.0, 0.0, 0
-        for e in batch:
-            ids = torch.tensor([e.ids], device="cuda")
-            m = torch.tensor(e.mask[1:], device="cuda", dtype=torch.bool)
-            vlp = torch.tensor(e.vlp[1:], device="cuda", dtype=torch.float32)[m]
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                h = backbone(input_ids=ids, use_cache=False).last_hidden_state[0, :-1][m]
-                logp = chunked_logp(h, ids[0, 1:][m])
-            with torch.no_grad():
-                diff = logp.detach() - vlp
-                w = torch.exp(diff).clamp(max=a.tis_cap)
-                mm_sum += diff.abs().sum().item()
-                clip_n += (torch.exp(diff) > a.tis_cap).sum().item()
-            loss = -(e.adv * w * logp).sum() / n_tok
-            loss.backward()
-            loss_sum += loss.item()
-            del ids, h, logp, loss
+        loss_sum, mm_sum, clip_n, oom, done_tok = 0.0, 0.0, 0, 0, 0
+        for e in sorted(batch, key=lambda e: len(e.ids)):
+            ids = m = vlp = h = logp = loss = None
+            try:
+                ids = torch.tensor([e.ids], device="cuda")
+                m = torch.tensor(e.mask[1:], device="cuda", dtype=torch.bool)
+                vlp = torch.tensor(e.vlp[1:], device="cuda", dtype=torch.float32)[m]
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    h = backbone(input_ids=ids, use_cache=False).last_hidden_state[0, :-1][m]
+                    logp = chunked_logp(h, ids[0, 1:][m])
+                with torch.no_grad():
+                    diff = logp.detach() - vlp
+                    w = torch.exp(diff).clamp(max=a.tis_cap)
+                    mm_sum += diff.abs().sum().item()
+                    clip_n += (torch.exp(diff) > a.tis_cap).sum().item()
+                loss = -(e.adv * w * logp).sum() / n_tok
+                loss.backward()
+                loss_sum += loss.item()
+                done_tok += int(m.sum().item())
+            except torch.OutOfMemoryError:
+                oom += 1
+                log(f"OOM in backward on a {len(e.ids)}-token episode; skipped")
+            finally:
+                ids = m = vlp = h = logp = loss = None
+                if oom:
+                    torch.cuda.empty_cache()
+        if done_tok == 0:
+            opt.zero_grad(set_to_none=True)
+            return dict(empty, oom=oom)
         gn = torch.nn.utils.clip_grad_norm_(trainable, a.max_grad_norm).item()
         opt.step()
         opt.zero_grad(set_to_none=True)
-        return dict(loss=loss_sum, grad_norm=gn, mismatch=mm_sum / n_tok, tis_clipped=clip_n / n_tok,
-                    trained_eps=len(batch), trained_tokens=n_tok)
+        return dict(loss=loss_sum, grad_norm=gn, mismatch=mm_sum / done_tok, tis_clipped=clip_n / done_tok,
+                    trained_eps=len(batch) - oom, trained_tokens=done_tok, skipped_long=skipped_long, oom=oom)
 
     def lora_diagnostics():
         """What vLLM wraps with LoRA vs what the trainer's adapter keys resolve to (printed when hand-off fails)."""
@@ -428,9 +487,19 @@ def main():
 
     # ------------------------------------------------------------ loop
     lr_at = lambda s: a.lr * min(1.0, (s + 1) / max(1, a.warmup))
+    step_times, eval_times, last_eval_step, done_steps = [], [], None, start_step
     if a.eval_at_start and a.eval_every and start_step == 0:
+        te = time.time()
         evaluate(0, lora_request(0))
+        eval_times.append(time.time() - te)
+        last_eval_step = 0
     for step in range(start_step, a.steps):
+        if a.deadline:                                 # leave room for one more step + final eval + checkpoint
+            need = (max(step_times[-3:]) if step_times else 1800) + (max(eval_times) if eval_times else 600) + 300
+            if time.time() + need > a.deadline:
+                log(f"deadline: stopping before step {step} (needs ~{need / 60:.0f} min, "
+                    f"{(a.deadline - time.time()) / 60:.0f} min left)")
+                break
         ts = time.time()
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
@@ -475,17 +544,24 @@ def main():
         log(f"STEP {step}: " + json.dumps({k_: (round(v, 4) if isinstance(v, float) else v) for k_, v in met.items()
                                             if k_ != "time"}))
         with open(out / "samples" / f"step_{step}.jsonl", "w") as f:
-            for e in sorted(eps, key=lambda e: -e.rw["reward"])[:1] + sorted(eps, key=lambda e: e.rw["reward"])[:1]:
+            ranked = sorted(eps, key=lambda e: -e.rw["reward"])
+            for e in ([ranked[0], ranked[-1]] if len(ranked) > 1 else ranked):    # best and worst (distinct)
                 f.write(json.dumps(dict(ep_record(e, step, "train"), label=e.task.label,
                                         transcript=tok.decode(e.ids[e.n_prompt:]))) + "\n")
+        step_times.append(time.time() - ts)
+        done_steps = step + 1
         if a.ckpt_every and (step + 1) % a.ckpt_every == 0:
             model.save_lora(str(out / "lora" / f"step_{step + 1}"))
         if a.eval_every and (step + 1) % a.eval_every == 0:
+            te = time.time()
             evaluate(step + 1, lora_request(step + 1))
+            eval_times.append(time.time() - te)
+            last_eval_step = step + 1
     if not a.smoke:
         model.save_lora(str(out / "lora" / "final"))
-        if a.eval_every and a.steps % a.eval_every:
-            evaluate(a.steps, lora_request(a.steps))
+        (out / "lora" / "final" / "STEP").write_text(str(done_steps))
+        if a.eval_every and last_eval_step != done_steps:
+            evaluate(done_steps, lora_request(done_steps))
     log("done")
 
 
