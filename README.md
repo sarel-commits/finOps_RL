@@ -98,6 +98,40 @@ policy cannot read labels, and the reward is `0.5 × F1 + 0.5 × exact set match
 evaluation. Training runs either with prime-rl (multi-GPU LoRA-GRPO) or `rl/scripts/train_grpo_unsloth.py` on a
 single H100 with the FP8 checkpoint. Details and run notes: [rl/README.md](rl/README.md).
 
+### Training experiments (1× H100, AWS p5.4xlarge)
+
+LoRA-GRPO on `Qwen/Qwen3.8-27B-FP8` with `rl/scripts/train_grpo_unsloth.py`: 6 generated tasks × 8 samples per step,
+LoRA r=16 (attention, MLP and GatedDeltaNet projections), lr 2e-5, 20 tool steps per episode, 32k context. Every 8
+steps the policy is evaluated on the 15 held-out ITBench-Lite scenarios (1 sample each, exact set match). Raw
+outputs (synced from the instance, not in git): `rl/results/aws_train*/` (`config.json`, `metrics.jsonl`,
+`eval.jsonl`, `train.log`, LoRA checkpoints every 5 steps).
+
+| Run | Change | Outcome |
+|---|---|---|
+| 1 `run1_lockstep` | rollouts in lockstep (every episode waits for the slowest one each turn) | stopped during step 0; replaced by asynchronous rollouts (each episode advances as soon as its turn or tool call finishes) |
+| 2 `run2_bf16kv` | asynchronous rollouts, bf16 KV cache (~492k tokens) | 1 step: 1,333 s (rollout 917 s, train 416 s); stopped to enlarge the KV cache |
+| 3 `aws_train` | `--fp8-kv` (KV cache 837k tokens, 25 concurrent 32k sequences) | **in progress**, 80 steps planned, deadline 2026-11-08 08:03 IST; ~10–15 min/step (rollout 340–640 s) |
+
+Run 3 on held-out ITBench-Lite, as of step 24 (2026-11-08 06:13 IST):
+
+| Eval step | Exact (of 15) | Mean reward | Answered | Hit 20-step cap | Mean steps |
+|---|---|---|---|---|---|
+| 0 (base) | 4 | 0.333 | 8 | 7 | 16.4 |
+| 8 | 6 | 0.400 | 6 | 9 | 15.8 |
+| 16 | 6 | 0.444 | 11 | 4 | 13.3 |
+| 24 | 6 | 0.489 | 12 | 2 | 12.3 |
+
+On training tasks (48 episodes per step), the answered rate went from 0.58 at step 0 to 0.75–0.92 over steps 21–23,
+and mean tool steps from 16.4 to 11–14. Per-step pass rate is noisy (0.06–0.54).
+
+- **What is moving:** the policy learns to stop and answer. Step-cap hits on ITBench-Lite fell from 7 to 2 and
+  mean steps from 16.4 to 12.3, the same failure the harness nudges fixed in the eval.
+- **What is not yet clear:** exact answers went from 4 to 6 of 15, i.e. two scenarios with one sample each, which is
+  within run-to-run noise (the base model scored 3 and 4 of 15 in the step-0 evals of runs 1 and 2). Of the 4 extra
+  answers, 2 are right and 2 are wrong.
+- **Health checks:** train/vLLM log-prob mismatch stays at ~0.025 nats/token, no OOMs, 0–5 long episodes per step
+  skipped from backprop (> 28k tokens), and 0–6 sandbox audit flags per step (logged, not penalized).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
