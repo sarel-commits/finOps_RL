@@ -52,6 +52,8 @@ def parse_args():
     ap.add_argument("--max-seq-len", type=int, default=32768)
     ap.add_argument("--gpu-mem", type=float, default=0.85)
     ap.add_argument("--max-num-seqs", type=int, default=64)
+    ap.add_argument("--fp8-kv", action="store_true",
+                    help="FP8 KV cache in vLLM (~2x context capacity; 48 concurrent 15k-token episodes need ~700k tokens)")
     ap.add_argument("--lora-rank", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--lora-targets", default=",".join(LORA_TARGETS))
@@ -171,7 +173,8 @@ def main():
         # The checkpoint is already block-FP8: load it as-is. load_in_fp8=True would add vLLM ONLINE fp8 quantization
         # on top, which vLLM rejects ("fp8 does not match fp8_per_channel").
         load_in_4bit=False, load_in_fp8=False, fast_inference=True, gpu_memory_utilization=a.gpu_mem,
-        max_lora_rank=a.lora_rank, max_num_seqs=a.max_num_seqs, text_only=True, random_state=a.seed)
+        max_lora_rank=a.lora_rank, max_num_seqs=a.max_num_seqs, float8_kv_cache=a.fp8_kv, text_only=True,
+        random_state=a.seed)
     tok = getattr(proc, "tokenizer", proc)
     model = FastModel.get_peft_model(
         model, r=a.lora_rank, lora_alpha=a.lora_alpha, lora_dropout=0.0, bias="none",
