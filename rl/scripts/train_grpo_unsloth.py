@@ -80,6 +80,19 @@ def parse_args():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--deadline", type=float, default=0.0,
                     help="unix time; no new step starts unless it plus a final eval + checkpoint fit before it")
+    ap.add_argument("--harness", default="v1", choices=["v1", "improved"],
+                    help="improved = the eval's *_nudges_v2 harness: system/task prompt v2, step-count nudges on tool "
+                         "outputs, budget warning at 5 left, and a forced final-answer turn when the budget is used up")
+    ap.add_argument("--reward-exact-weight", type=float, default=0.5, help="reward = (1-w)*F1 + w*exact")
+    ap.add_argument("--val-n", type=int, default=0, help="synthetic val tasks evaluated at each eval (0 = off)")
+    ap.add_argument("--eval-ckpts", default="",
+                    help="comma-separated saved LoRA dirs: evaluate each (ITBench + val, same as in training) and exit")
+    ap.add_argument("--sft-data", default="", help="teacher trajectories (jsonl with OpenAI-format messages): SFT the "
+                                                     "LoRA on them before GRPO (skipped if lora/sft already exists)")
+    ap.add_argument("--init-lora", default="", help="saved LoRA dir to start from (e.g. a previous run's checkpoint)")
+    ap.add_argument("--sft-epochs", type=int, default=2)
+    ap.add_argument("--sft-lr", type=float, default=1e-4)
+    ap.add_argument("--sft-batch", type=int, default=8, help="trajectories per SFT optimizer update")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     if a.smoke:
@@ -116,6 +129,47 @@ def parse_tool_calls(text: str):
     return (text[:i] if i >= 0 else text).strip(), calls
 
 
+# ---------------------------------------------------------------- SFT warm start (teacher trajectories)
+_THINK_RE = re.compile(r"^<think>.*?</think>\s*", re.S)
+
+
+def assistant_text(m: dict, render) -> str:
+    """The text the policy would generate for this assistant message (content + qwen3_coder tool-call XML), up to but
+    excluding <|im_end|>, taken from the chat template itself so it matches what parse_tool_calls reads."""
+    base = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    am = {"role": "assistant", "content": m.get("content") or ""}
+    if m.get("tool_calls"):
+        am["tool_calls"] = [{"type": "function", "function": {"name": c["function"]["name"],
+                                                              "arguments": json.loads(c["function"]["arguments"])}}
+                            for c in m["tool_calls"]]
+    head, full = render(base, False), render(base + [am], False)
+    assert full.startswith(head), "chat template re-renders earlier turns"
+    seg = full[len(head):]
+    seg = seg[seg.index("<|im_start|>assistant\n") + len("<|im_start|>assistant\n"):]
+    return _THINK_RE.sub("", seg[:seg.index("<|im_end|>")], count=1)
+
+
+def sft_example(msgs: list, tok, render, tool_delta, im_end: int):
+    """(ids, mask) laid out exactly like a rollout: prompt + generation header, then per assistant turn the tokens the
+    policy would sample (mask 1, ending in <|im_end|>), then the template tokens of its tool results (mask 0)."""
+    ids = tok(render(msgs[:2], True), add_special_tokens=False).input_ids
+    mask, i = [0] * len(ids), 2
+    while i < len(msgs):
+        assert msgs[i]["role"] == "assistant", msgs[i]["role"]
+        gen = tok(assistant_text(msgs[i], render), add_special_tokens=False).input_ids + [im_end]
+        ids, mask, i = ids + gen, mask + [1] * len(gen), i + 1
+        outs, user_after = [], None
+        while i < len(msgs) and msgs[i]["role"] == "tool":
+            outs.append(msgs[i]["content"])
+            i += 1
+        if i < len(msgs) and msgs[i]["role"] == "user":
+            user_after, i = msgs[i]["content"], i + 1
+        if outs:
+            d = tool_delta(outs, user_after)
+            ids, mask = ids + d, mask + [0] * len(d)
+    return ids, mask
+
+
 # ---------------------------------------------------------------- episodes
 @dataclass
 class Ep:
@@ -129,6 +183,7 @@ class Ep:
     steps: int = 0
     turns: int = 0
     done: bool = False
+    forced: bool = False                         # improved harness: the forced final-answer turn was issued
     final: str | None = None
     err: str | None = None
     flags: list = field(default_factory=list)
@@ -148,7 +203,7 @@ def main():
 
     from finops_gym import tasks as T
     from finops_gym.generator import materialize
-    from finops_gym.prompts import RUN_PYTHON_TOOL, SYSTEM, task_prompt
+    from finops_gym.prompts import NUDGE_FINAL, RUN_PYTHON_TOOL, nudge, system_prompt, task_prompt_for
     from finops_gym.reward import RewardConfig, compute_reward
     from finops_gym.sandbox import Sandbox, SandboxConfig, audit_code
 
@@ -217,18 +272,20 @@ def main():
                                        add_generation_prompt=gen_prompt, enable_thinking=False)
 
     def prompt_ids(task):
-        return tok(render([{"role": "system", "content": SYSTEM},
-                           {"role": "user", "content": task_prompt(task.anomaly)}], True),
+        return tok(render([{"role": "system", "content": system_prompt(a.harness, a.max_steps)},
+                           {"role": "user", "content": task_prompt_for(task.anomaly, a.harness)}], True),
                    add_special_tokens=False).input_ids
 
-    def tool_delta(outputs):
-        """Template tokens that follow an assistant turn ending in <|im_end|>: the tool results + next turn header."""
+    def tool_delta(outputs, user_after=None):
+        """Template tokens that follow an assistant turn ending in <|im_end|>: the tool results (+ an optional user
+        message, the improved harness's forced-final prompt) + next turn header."""
         base = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
                 {"role": "assistant", "content": "",
                  "tool_calls": [{"type": "function", "function": {"name": "run_python", "arguments": {"code": "x"}}}
                                 for _ in outputs]}]
         a_ = render(base, False)
-        b_ = render(base + [{"role": "tool", "content": o} for o in outputs], True)
+        b_ = render(base + [{"role": "tool", "content": o} for o in outputs]
+                    + ([{"role": "user", "content": user_after}] if user_after else []), True)
         if not b_.startswith(a_):
             raise RuntimeError("chat template re-renders earlier turns; token deltas would be wrong")
         end = a_.rindex("<|im_end|>") + len("<|im_end|>")
@@ -236,6 +293,8 @@ def main():
 
     d = tok.decode(tool_delta(["OUT1", "OUT2"]))
     assert "OUT1" in d and "OUT2" in d and d.rstrip().endswith(("assistant", "</think>")), d
+    df = tok.decode(tool_delta(["OUT1"], NUDGE_FINAL))
+    assert "OUT1" in df and NUDGE_FINAL in df and df.index("OUT1") < df.index(NUDGE_FINAL), df
     c_, k_ = parse_tool_calls("look\n<tool_call>\n<function=run_python>\n<parameter=code>\nprint(1)\n</parameter>\n"
                               "</function>\n</tool_call>")
     assert c_ == "look" and k_ == [("run_python", {"code": "print(1)"})], (c_, k_)
@@ -248,10 +307,12 @@ def main():
     for t in itb:                                      # manifest paths point at the machine that built it
         if t.source_dir and not Path(t.source_dir).exists():
             t.source_dir = str(Path(a.itbench_root) / Path(t.source_dir).name)
-    log(f"train tasks {len(train)} | itbench_lite {len(itb)}")
+    val = T.load(T.manifest_path("val"))[:a.val_n] if a.val_n else []   # fixed subset: comparable across evals
+    log(f"train tasks {len(train)} | itbench_lite {len(itb)} | val {len(val)} | harness {a.harness} | "
+        f"reward exact weight {a.reward_exact_weight}")
 
     pool = ThreadPoolExecutor(a.tool_workers)
-    rcfg = RewardConfig()
+    rcfg = RewardConfig(exact_weight=a.reward_exact_weight)
 
     def run_tools(job):
         e, calls = job
@@ -276,6 +337,11 @@ def main():
         e.turns += 1
         stopped = bool(gen) and gen[-1] in STOP_IDS
         content, calls = parse_tool_calls(tok.decode(gen[:-1] if stopped else gen, skip_special_tokens=False))
+        if e.forced:                                   # forced final turn: tools are off, this text is the answer
+            e.final, e.done = content, True
+            if calls:
+                e.err = "forced_final_tool_call"
+            return None
         if not calls:
             e.final, e.done = content, True
             return None
@@ -342,7 +408,12 @@ def main():
                         outs_ = f.result()
                     except Exception as ex:            # a tool failure must not kill the step
                         outs_ = [f"[error: tool execution failed: {type(ex).__name__}]"] * n_calls
-                    dlt = tool_delta(outs_)
+                    user_after = None
+                    if a.harness == "improved":
+                        outs_[-1] = outs_[-1] + nudge(e.steps, a.max_steps)
+                        if e.steps >= a.max_steps:     # budget used up: one more turn, answer only
+                            user_after, e.forced = NUDGE_FINAL, True
+                    dlt = tool_delta(outs_, user_after)
                     e.ids += dlt
                     e.mask += [0] * len(dlt)
                     e.vlp += [0.0] * len(dlt)
@@ -377,7 +448,8 @@ def main():
         r = e.rw
         return dict(kind=kind, step=step, task_id=e.task.task_id, sample=e.sample, regime=e.task.regime,
                     mechanism=e.task.mechanism, reward=r["reward"], exact=r["exact"], f1=round(r["f1"], 3),
-                    format_ok=r["format_ok"], steps=e.steps, turns=e.turns, err=e.err, adv=round(e.adv, 4),
+                    format_ok=r["format_ok"], steps=e.steps, turns=e.turns, err=e.err, forced=e.forced,
+                    adv=round(e.adv, 4),
                     gen_tokens=sum(e.mask), seq_tokens=len(e.ids), audit=sorted(set(e.flags)))
 
     def append(name, rows):
@@ -478,15 +550,116 @@ def main():
 
     def evaluate(step, lora_req):
         t = time.time()
-        eps = rollout([Ep(task, s, gi) for gi, task in enumerate(itb) for s in range(a.eval_samples)], eval_sp, lora_req)
-        recs = [ep_record(e, step, "eval_itbench") for e in eps]
+        n_itb = len(itb) * a.eval_samples
+        eps = rollout([Ep(task, s, gi) for gi, task in enumerate(itb) for s in range(a.eval_samples)]
+                      + [Ep(task, 0, len(itb) + gi) for gi, task in enumerate(val)], eval_sp, lora_req)
+        recs = [ep_record(e, step, "eval_itbench") for e in eps[:n_itb]]
+        vrecs = [ep_record(e, step, "eval_val") for e in eps[n_itb:]]
         append("eval.jsonl", recs)
+        if vrecs:
+            append("eval_val.jsonl", vrecs)       # separate file: the dashboard aggregates eval.jsonl as ITBench
         n = len(recs)
         res = dict(step=step, itbench_pass=sum(r["exact"] for r in recs) / n,
                    itbench_reward=sum(r["reward"] for r in recs) / n,
                    itbench_answered=sum(r["format_ok"] for r in recs) / n, eval_s=round(time.time() - t, 1))
+        if vrecs:
+            res.update(val_pass=sum(r["exact"] for r in vrecs) / len(vrecs),
+                       val_reward=sum(r["reward"] for r in vrecs) / len(vrecs),
+                       val_answered=sum(r["format_ok"] for r in vrecs) / len(vrecs))
         log(f"EVAL step {step}: {json.dumps(res)}")
         return res
+
+    if a.eval_ckpts:                                   # eval-only: score saved checkpoints, no training
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+        for ck in [Path(c) for c in a.eval_ckpts.split(",") if c]:
+            n = int((ck / "STEP").read_text()) if (ck / "STEP").exists() else int(ck.name.split("_")[1])
+            set_peft_model_state_dict(model, load_file(str(ck / "adapter_model.safetensors")))
+            log(f"eval-only: loaded {ck} (step {n})")
+            evaluate(n, lora_request(n))
+        log("done")
+        return
+
+    def sft(path):
+        """Supervised warm start: mean NLL of the teacher's assistant tokens (tool outputs masked), AdamW on the LoRA,
+        linear warmup then cosine decay to 10%. Its own optimizer; GRPO starts with a fresh one."""
+        import math
+        rows = [json.loads(l) for l in open(path)]
+        exs = [sft_example(r["messages"], tok, render, tool_delta, IM_END) for r in rows]
+        long_ = sum(len(x) > a.train_max_tokens for x, _ in exs)
+        exs = [(x, m) for x, m in exs if len(x) <= a.train_max_tokens][:4 if a.smoke else None]
+        n_upd = a.sft_epochs * math.ceil(len(exs) / a.sft_batch)
+        log(f"SFT: {len(exs)} trajectories ({long_} over {a.train_max_tokens} tokens skipped), "
+            f"{sum(sum(m) for _, m in exs)} trained tokens/epoch, {a.sft_epochs} epochs, {n_upd} updates")
+        sopt = torch.optim.AdamW(trainable, lr=a.sft_lr, betas=(0.9, 0.99), weight_decay=0.0)
+        rng, upd, t = random.Random(a.seed), 0, time.time()
+        if sleep_mode:                                 # free vLLM's KV cache for training, as rollout() does
+            llm.sleep(1)
+            torch.cuda.empty_cache()
+        log(f"SFT start | GPU used {gpu_used_gb()} GB")
+        model.train()
+        for ep in range(a.sft_epochs):
+            order = exs[:]
+            rng.shuffle(order)
+            for b in range(0, len(order), a.sft_batch):
+                batch = order[b:b + a.sft_batch]
+                warm = min(1.0, (upd + 1) / max(1, a.warmup))
+                lr = a.sft_lr * warm * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * upd / max(1, n_upd - 1))))
+                for g in sopt.param_groups:
+                    g["lr"] = lr
+                n_tok = sum(sum(m) for _, m in batch)
+                nll, oom = 0.0, 0
+                for x, mk in batch:
+                    ids = m = h = logp = loss = None
+                    try:
+                        ids = torch.tensor([x], device="cuda")
+                        m = torch.tensor(mk[1:], device="cuda", dtype=torch.bool)
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            h = backbone(input_ids=ids, use_cache=False).last_hidden_state[0, :-1][m]
+                            logp = chunked_logp(h, ids[0, 1:][m])
+                        loss = -logp.sum() / n_tok
+                        loss.backward()
+                        nll += loss.item()
+                    except torch.OutOfMemoryError:
+                        oom += 1
+                        log(f"SFT OOM on a {len(x)}-token trajectory; skipped")
+                    finally:
+                        ids = m = h = logp = loss = None
+                        if oom:
+                            torch.cuda.empty_cache()
+                if oom == len(batch):                  # nothing trained: drop partial grads instead of stepping
+                    sopt.zero_grad(set_to_none=True)
+                    gn = 0.0
+                else:
+                    gn = torch.nn.utils.clip_grad_norm_(trainable, a.max_grad_norm).item()
+                    sopt.step()
+                    sopt.zero_grad(set_to_none=True)
+                upd += 1
+                rec = dict(update=upd, epoch=ep, lr=lr, nll=round(nll, 4), grad_norm=round(gn, 4), tokens=n_tok,
+                           oom=oom, t=round(time.time() - t, 1))
+                append("sft_metrics.jsonl", [rec])
+                log(f"SFT {json.dumps(rec)}")
+        if not a.smoke:
+            model.save_lora(str(out / "lora" / "sft"))
+        log(f"SFT done in {(time.time() - t) / 60:.1f} min -> lora/sft")
+
+    sft_dir = out / "lora" / "sft"
+    if a.init_lora and start_step == 0 and not (sft_dir / "adapter_model.safetensors").exists():
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+        res = set_peft_model_state_dict(model, load_file(str(Path(a.init_lora) / "adapter_model.safetensors")))
+        missing = [k for k in getattr(res, "missing_keys", []) if "lora_" in k]
+        if missing:
+            raise RuntimeError(f"--init-lora left {len(missing)} LoRA weights unset, e.g. {missing[:3]}")
+        log(f"initialised LoRA from {a.init_lora}")
+    if a.sft_data and start_step == 0:
+        if (sft_dir / "adapter_model.safetensors").exists():
+            from peft import set_peft_model_state_dict
+            from safetensors.torch import load_file
+            set_peft_model_state_dict(model, load_file(str(sft_dir / "adapter_model.safetensors")))
+            log(f"loaded SFT warm start from {sft_dir}")
+        else:
+            sft(a.sft_data)
 
     # ------------------------------------------------------------ loop
     lr_at = lambda s: a.lr * min(1.0, (s + 1) / max(1, a.warmup))
@@ -533,7 +706,8 @@ def main():
         met = dict(step=step, lr=lr_at(step),
                    reward=sum(r["reward"] for r in recs) / n, pass_rate=sum(r["exact"] for r in recs) / n,
                    answered=sum(r["format_ok"] for r in recs) / n,
-                   hit_budget=sum(r["err"] == "max_steps" for r in recs) / n,
+                   hit_budget=sum(r["err"] == "max_steps" or r["forced"] for r in recs) / n,
+                   forced_answered=sum(r["forced"] and r["format_ok"] for r in recs) / n,
                    hit_context=sum(r["err"] == "context" for r in recs) / n,
                    mean_steps=sum(r["steps"] for r in recs) / n,
                    mean_gen_tokens=sum(r["gen_tokens"] for r in recs) / n,

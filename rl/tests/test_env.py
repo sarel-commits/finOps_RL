@@ -38,6 +38,13 @@ def test_reward_format_gate():
     assert compute_reward("", GT)["format_ok"] == 0
 
 
+def test_exact_weight():
+    gt = [{"name": "a", "type": "Application"}]
+    two = '<answer>{"resource":[{"name":"a","type":"Application"},{"name":"b","type":"Application"}]}</answer>'
+    assert abs(compute_reward(two, gt)["reward"] - 1 / 3) < 1e-9
+    assert abs(compute_reward(two, gt, cfg=RewardConfig(exact_weight=0.7))["reward"] - 0.2) < 1e-9
+
+
 def test_step_cost_only_applies_to_correct_answers():
     cfg = RewardConfig(step_cost=0.2)
     right = compute_reward(ans(GT), GT, steps_used=20, cfg=cfg)["reward"]
@@ -110,6 +117,8 @@ def test_sandbox_isolation():
 def test_audit_flags():
     assert audit_code("open('../../data/train.jsonl')")
     assert not audit_code("import pandas as pd\ndf=pd.read_csv('data.csv')")
+    assert audit_code("json.load(open('labels.json'))") == ["label_file"]
+    assert not audit_code("pd.cut(x, bins=3, labels=['a','b','c'])\nidx.get_loc(label)\nplt.xlabel('d')")
 
 
 # ---------- prompt parity with the eval harness ----------
@@ -122,3 +131,6 @@ def test_prompts_match_eval_harness():
     assert TASK == run_bench.ITB_PROMPT
     from finops_gym.prompts import RUN_PYTHON_TOOL
     assert RUN_PYTHON_TOOL == agent.RUN_PYTHON_TOOL
+    from finops_gym import prompts as P
+    assert P.SYSTEM_V2 == agent.SYSTEM_NATIVE_V2 and P.TASK_V2 == run_bench.ITB_PROMPT_V2
+    assert (P.NUDGE_STEP, P.NUDGE_WARN, P.NUDGE_FINAL) == (agent.NUDGE_STEP, agent.NUDGE_WARN, agent.NUDGE_FINAL)

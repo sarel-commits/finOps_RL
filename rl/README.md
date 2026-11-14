@@ -126,6 +126,29 @@ Findings from getting it to run (2026-11-07):
   (`--train-max-tokens`; they still count in group means) and an OOM skips the episode instead of the run.
 * After the first step's Triton autotuning, training costs ~0.36 ms/token; rollouts dominate the step time.
 
+### First run (2026-11-07/08, 1×H100 spot, ~9.6 h, ~$35)
+
+32 GRPO steps × 48 episodes (6 tasks × 8), LoRA r=16 on Qwen3.8-27B-FP8, lr 2e-5, async rollouts, FP8 KV cache;
+stopped by the deadline guard. Outputs: `results/aws_train/` (metrics, rollouts, evals, samples, LoRA step_5..30 +
+final), backups in `results/backups/run2/`.
+
+ITBench-Lite (15 real scenarios, one sample each, model-card sampling):
+
+| | exact | answered | reward | tool steps |
+|---|---|---|---|---|
+| baseline (3 runs, 45 episodes) | 24.4% | 48.9% | 0.32 | 16.1 |
+| after step 8 | 40.0% | 40.0% | 0.40 | 15.8 |
+| after step 16 | 40.0% | 73.3% | 0.44 | 13.3 |
+| after step 24 | 40.0% | 80.0% | 0.49 | 12.3 |
+| after step 32 (final) | **46.7%** | **86.7%** | **0.53** | 10.5 |
+
+Final vs baseline: answered p=0.01; exact p=0.10 (pooled over the four post-training evals 41.7%, p=0.066). Train
+episodes (synthetic, T=1.0) over steps 0-7 -> 24-31: reward 0.235 -> 0.405, answered 55% -> 86%, tool steps 16.1 -> 12.0.
+The main learned behaviour is committing to an answer within the 20-step budget; exactness of the answers improved less.
+Caveats: 15 scenarios with one sample per eval is noisy; ITBench-Lite was never trained on, but S1-S10 vs S11-S15 use
+different labelling regimes (see findings above). No OOM; 45 long episodes (>28k tokens) were not backpropagated.
+The `label` audit tripwire fires on ordinary code (`xlabel`, `labels=`) and should be narrowed.
+
 ## Not done / to verify on the GPU node
 
 * The prime-rl TOML has not been schema-validated (installing `prime-rl-configs` was not permitted in this session);

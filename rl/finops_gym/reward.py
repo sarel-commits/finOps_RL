@@ -9,7 +9,8 @@ training reward penalizes extra resources: otherwise RL learns to list many reso
 Reward (RewardConfig.mode):
   "f1"        : F1 over (name, type) pairs
   "exact"     : 1 iff predicted set == GT set
-  "f1+exact"  : 0.5 * F1 + 0.5 * exact          (default: dense signal + bonus for the clean answer)
+  "f1+exact"  : (1 - w) * F1 + w * exact, w = exact_weight (default 0.5: dense signal + bonus for the clean answer;
+                run 3 uses 0.7 so that listing extra resources costs more: 1 right + 1 extra -> 0.2 instead of 0.33)
 Format gate: no parseable <answer>{"resource": [...]}</answer> in the final message -> format_penalty (default 0).
 Optional step cost (off by default): reward -= step_cost * steps_used / max_steps, applied only when exact == 1,
 so it can never make a wrong answer look better than a slower right one.
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 @dataclass
 class RewardConfig:
     mode: str = "f1+exact"
+    exact_weight: float = 0.5
     format_penalty: float = 0.0
     step_cost: float = 0.0
     require_tags: bool = True       # training: the answer must be inside <answer></answer>
@@ -91,7 +93,7 @@ def compute_reward(final_text: str, gt: list[dict], steps_used: int = 0, max_ste
     elif cfg.mode == "exact":
         r = float(s["exact"])
     elif cfg.mode == "f1+exact":
-        r = 0.5 * s["f1"] + 0.5 * s["exact"]
+        r = (1 - cfg.exact_weight) * s["f1"] + cfg.exact_weight * s["exact"]
     else:
         raise ValueError(cfg.mode)
     if cfg.step_cost and s["exact"]:
